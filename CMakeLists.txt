@@ -193,6 +193,7 @@ target_link_libraries(
     d3d9
     d3dx9
     user32
+    gdi32
 )
 
 set_target_properties(

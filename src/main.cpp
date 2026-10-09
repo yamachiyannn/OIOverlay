@@ -17,8 +17,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -34,8 +36,11 @@ constexpr wchar_t kWindowClassName[] = L"OIOverlayModuleLayerWindow";
 constexpr UINT kRefreshMessage = WM_APP + 9;
 
 HMODULE g_module = nullptr;
-HWND g_overlayWindow = nullptr;
+HWND g_overlayWindow = nullptr; // opponent-information layer
+HWND g_inputWindow = nullptr;
+HWND g_warningWindow = nullptr;
 HWND g_gameWindow = nullptr;
+enum class OverlayLayer : LONG_PTR { Info = 1, Input = 2, Warning = 3 };
 HHOOK g_keyboardHook = nullptr;
 volatile LONG g_stopRequested = 0;
 int g_sceneId = -1;
@@ -43,6 +48,8 @@ bool g_clientMode = false;
 bool g_overlayEnabled = true;
 bool g_previousF10Down = false;
 bool g_tskRunning = false;
+enum class TskWarningState { None, NotRunning, GameNotDetected };
+TskWarningState g_tskWarningState = TskWarningState::None;
 bool g_warningBlink = false;
 bool g_inputEnabled = false;
 bool g_suppressedKeys[256]{};
@@ -65,12 +72,27 @@ bool g_watchP1StatsValid = false;
 bool g_watchP2StatsValid = false;
 std::uintmax_t g_dbSize = 0;
 FILETIME g_dbWriteTime{};
+RECT g_lastGameClientRect{};
+HWND g_lastLocatedGameWindow = nullptr;
+bool g_haveLastGameClientRect = false;
+bool g_overlayWasVisible = false;
 
 using Clock = std::chrono::steady_clock;
 Clock::time_point g_lastTskCheck{};
 Clock::time_point g_lastDbCheck{};
 Clock::time_point g_lastStatsRefresh{};
 Clock::time_point g_lastWarningBlink{};
+Clock::time_point g_lastCharacterRefresh{};
+Clock::time_point g_lastWindowSearch{};
+Clock::time_point g_lastGeometryCheck{};
+
+void RequestWindowRedraw(HWND window);
+void RequestInfoRedraw();
+void RequestInputRedraw();
+void RequestWarningRedraw();
+void RequestRedraw(); // all layers: startup, focus return or viewport geometry change
+void UpdateInputText();
+void UpdateInfoText();
 
 bool IsFileTimeEqual(const FILETIME& a, const FILETIME& b)
 {
@@ -436,56 +458,113 @@ bool PasteClipboardIp()
     return true;
 }
 
+bool IsAltPressed(const KBDLLHOOKSTRUCT& key)
+{
+    return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 || (key.flags & LLKHF_ALTDOWN) != 0;
+}
+
+bool IsControlPressed()
+{
+    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+}
+
+bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
+{
+    // Translate through the active Windows keyboard layout so punctuation works
+    // on Japanese/JIS keyboards instead of relying on only US virtual-key codes.
+    BYTE state[256]{};
+    if (GetKeyboardState(state)) {
+        state[vk] |= 0x80;
+        if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) state[VK_SHIFT] |= 0x80;
+        else state[VK_SHIFT] &= 0x7f;
+        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) state[VK_CONTROL] |= 0x80;
+        if (IsAltPressed(key)) state[VK_MENU] |= 0x80;
+        wchar_t translated[8]{};
+        const int count = ToUnicodeEx(vk, key.scanCode, state, translated,
+            static_cast<int>(_countof(translated)), 0, GetKeyboardLayout(0));
+        if (count == 1) {
+            const wchar_t c = translated[0];
+            if ((c >= L'0' && c <= L'9') || c == L'.' || c == L':') {
+                result = static_cast<char>(c);
+                return true;
+            }
+        }
+    }
+
+    // Fallbacks cover numpad digits and punctuation mappings when translation fails.
+    if (vk >= '0' && vk <= '9' && (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0 &&
+        !IsControlPressed() && !IsAltPressed(key)) {
+        result = static_cast<char>(vk);
+        return true;
+    }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+        result = static_cast<char>('0' + (vk - VK_NUMPAD0));
+        return true;
+    }
+    if (vk == VK_DECIMAL) {
+        result = '.';
+        return true;
+    }
+    if (vk == VK_OEM_PERIOD && (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0) {
+        result = '.';
+        return true;
+    }
+    if ((vk == VK_OEM_1 || vk == VK_OEM_PLUS) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) {
+        result = ':';
+        return true;
+    }
+    return false;
+}
+
 LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
 {
     if (code < 0 || data == 0)
         return CallNextHookEx(g_keyboardHook, code, message, data);
 
-    const auto* key = reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
-    const DWORD vk = key->vkCode;
+    const auto& key = *reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
+    const DWORD vk = key.vkCode;
     const bool isDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
     const bool isUp = message == WM_KEYUP || message == WM_SYSKEYUP;
 
-    // For keys consumed during input, consume key-up as well.
+    // Consume the key-up matching any intercepted key-down, even after a scene change.
     if (isUp && vk < _countof(g_suppressedKeys) && g_suppressedKeys[vk]) {
         g_suppressedKeys[vk] = false;
         return 1;
     }
-
     if (!isDown || !g_inputEnabled || g_sceneId != 2 || !IsGameForeground())
         return CallNextHookEx(g_keyboardHook, code, message, data);
 
-    bool consume = true;
+    bool consume = false;
     if (vk == VK_RETURN) {
+        // Alt+Enter must reach the vanilla game to toggle fullscreen.
+        if (IsAltPressed(key))
+            return CallNextHookEx(g_keyboardHook, code, message, data);
         SetClipboardText(g_inputBuffer);
         g_inputBuffer.clear();
-    } else if (vk == VK_BACK) {
-        if (!g_inputBuffer.empty())
-            g_inputBuffer.pop_back();
-    } else if (vk == 'V' && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+        UpdateInputText();
+        consume = true;
+    } else if (vk == VK_BACK && !IsAltPressed(key) && !IsControlPressed()) {
+        if (!g_inputBuffer.empty()) g_inputBuffer.pop_back();
+        UpdateInputText();
+        consume = true;
+    } else if (vk == 'V' && IsControlPressed() && !IsAltPressed(key)) {
         PasteClipboardIp();
-    } else if (vk >= '0' && vk <= '9') {
-        AppendIpCharacter(static_cast<char>(vk));
-    } else if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
-        AppendIpCharacter(static_cast<char>('0' + (vk - VK_NUMPAD0)));
-    } else if (vk == VK_OEM_PERIOD || vk == VK_DECIMAL) {
-        AppendIpCharacter('.');
-    } else if ((vk == VK_OEM_1 || vk == VK_OEM_PLUS) &&
-               (GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
-        // US layout uses Shift+OEM_1; Japanese layout may use Shift+OEM_PLUS.
-        AppendIpCharacter(':');
-    } else {
-        consume = false;
+        UpdateInputText();
+        consume = true;
+    } else if (!IsAltPressed(key) && !IsControlPressed()) {
+        char character = 0;
+        if (TryGetIpCharacter(vk, key, character)) {
+            AppendIpCharacter(character);
+            UpdateInputText();
+            consume = true;
+        }
     }
 
     if (!consume)
         return CallNextHookEx(g_keyboardHook, code, message, data);
-
-    if (vk < _countof(g_suppressedKeys))
-        g_suppressedKeys[vk] = true;
-    if (g_overlayWindow)
-        InvalidateRect(g_overlayWindow, nullptr, FALSE);
-    return 1; // Avoid letting the network menu react to text-entry keys.
+    if (vk < _countof(g_suppressedKeys)) g_suppressedKeys[vk] = true;
+    RequestInputRedraw();
+    return 1;
 }
 
 BOOL CALLBACK FindGameWindowCallback(HWND window, LPARAM parameter)
@@ -591,96 +670,131 @@ void RefreshStats(bool force)
     }
 }
 
-void UpdateSceneState()
+bool UpdateSceneState()
 {
     const int scene = ReadSceneId();
-    const bool changed = scene != g_sceneId;
-    if (changed) {
-        const int oldScene = g_sceneId;
-        g_sceneId = scene;
-        if (scene <= 7)
-            g_clientMode = false;
-        if (scene != 2) {
-            // The input field is strictly a SceneID 2 feature.
-            g_inputBuffer.clear();
-            g_inputEnabled = false;
-        } else {
-            g_inputBuffer.clear();
-            g_inputEnabled = true;
-        }
-        if (scene == 9)
-            g_clientMode = true;
-        if (oldScene == 2 && scene != 2)
-            g_inputBuffer.clear();
-    }
+    if (scene == g_sceneId)
+        return false;
+
+    const int oldScene = g_sceneId;
+    g_sceneId = scene;
     if (scene <= 7) {
         g_clientMode = false;
+        g_opponentProfile.clear();
+        g_normalStats = {};
+        g_normalStatsValid = false;
+        g_cachedNormalProfile.clear();
     } else if (scene == 9) {
+        // OIV remembers client mode until the scene returns below 8.
         g_clientMode = true;
     }
 
+    // SceneID 2 only. Any transition out clears the pending input immediately.
+    if (scene == 2) {
+        g_inputBuffer.clear();
+        g_inputEnabled = true;
+    } else {
+        g_inputBuffer.clear();
+        g_inputEnabled = false;
+    }
+
     if (scene == 12 || scene == 15) {
+        // Spectator profiles/stats are re-read only at scene transitions.
         const std::string p1 = ReadProfile(kLeftProfileOffset);
         const std::string p2 = ReadProfile(kRightProfileOffset);
         if (p1 != g_watchingP1Profile) {
             g_watchingP1Profile = p1;
             g_watchP1Stats = {};
             g_watchP1StatsValid = false;
+            g_cachedWatchingP1.clear();
         }
         if (p2 != g_watchingP2Profile) {
             g_watchingP2Profile = p2;
             g_watchP2Stats = {};
             g_watchP2StatsValid = false;
+            g_cachedWatchingP2.clear();
         }
     } else if (scene >= 8 && scene <= 14) {
         const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
         const std::string opponent = ReadProfile(offset);
-        if (!opponent.empty() && opponent != g_opponentProfile) {
+        if (opponent != g_opponentProfile) {
             g_opponentProfile = opponent;
             g_normalStats = {};
             g_normalStatsValid = false;
+            g_cachedNormalProfile.clear();
         }
+        if (oldScene <= 7 && opponent.empty())
+            g_opponentProfile.clear();
     }
+
+    return true;
+}
+
+void RequestWindowRedraw(HWND window)
+{
+    if (window && IsWindow(window))
+        PostMessageW(window, kRefreshMessage, 0, 0);
+}
+
+void RequestInfoRedraw() { RequestWindowRedraw(g_overlayWindow); }
+void RequestInputRedraw() { RequestWindowRedraw(g_inputWindow); }
+void RequestWarningRedraw() { RequestWindowRedraw(g_warningWindow); }
+
+void RequestRedraw()
+{
+    RequestInfoRedraw();
+    RequestInputRedraw();
+    RequestWarningRedraw();
 }
 
 void UpdateInfoText()
 {
-    if (!g_overlayEnabled) {
-        g_infoLines.clear();
-        return;
+    std::vector<std::wstring> next;
+    if (g_overlayEnabled) {
+        if (g_sceneId >= 8 && g_sceneId <= 11)
+            SplitLines(BuildNormalInfo(), next);
+        else if (g_sceneId == 12 || g_sceneId == 15)
+            SplitLines(BuildWatchingInfo(), next);
     }
-    if (g_sceneId >= 8 && g_sceneId <= 11) {
-        SplitLines(BuildNormalInfo(), g_infoLines);
-        return;
-    }
-    if (g_sceneId == 12 || g_sceneId == 15) {
-        SplitLines(BuildWatchingInfo(), g_infoLines);
-        return;
-    }
-    g_infoLines.clear();
+    if (next != g_infoLines)
+        g_infoLines = std::move(next);
 }
 
 void UpdateInputText()
 {
-    if (!g_inputEnabled || g_sceneId != 2) {
-        g_inputLine.clear();
-        return;
-    }
-    g_inputLine = L"IP:Port ＞ " + NarrowAsciiToWide(g_inputBuffer) + L"_";
+    std::wstring next;
+    if (g_inputEnabled && g_sceneId == 2)
+        next = L"IP:Port ＞ " + NarrowAsciiToWide(g_inputBuffer) + L"_";
+    if (next != g_inputLine)
+        g_inputLine = std::move(next);
 }
 
-void DrawTextLine(HDC dc, const std::wstring& line, int x, int y, int width, int height, COLORREF color, HFONT font)
+void DrawTextLine(HDC dc, const std::wstring& line, int x, int y, int width, int height, COLORREF color, HFONT font,
+    UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
 {
     SetTextColor(dc, color);
     HGDIOBJ oldFont = SelectObject(dc, font);
     RECT r{ x, y, x + width, y + height };
-    DrawTextW(dc, line.c_str(), static_cast<int>(line.size()), &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    DrawTextW(dc, line.c_str(), static_cast<int>(line.size()), &r, format);
     SelectObject(dc, oldFont);
 }
 
-void DrawPanel(HDC dc, const RECT& rect, COLORREF borderColor)
+struct AlphaFill {
+    COLORREF color;
+    BYTE alpha;
+};
+
+int ColorDistance(COLORREF a, COLORREF b)
 {
-    HBRUSH background = CreateSolidBrush(RGB(12, 12, 18));
+    return abs(static_cast<int>(GetRValue(a)) - static_cast<int>(GetRValue(b))) +
+        abs(static_cast<int>(GetGValue(a)) - static_cast<int>(GetGValue(b))) +
+        abs(static_cast<int>(GetBValue(a)) - static_cast<int>(GetBValue(b)));
+}
+
+void DrawPanel(HDC dc, const RECT& rect, COLORREF backgroundColor, COLORREF borderColor,
+    std::vector<AlphaFill>& fills, BYTE backgroundAlpha)
+{
+    HBRUSH background = CreateSolidBrush(backgroundColor);
     FillRect(dc, &rect, background);
     DeleteObject(background);
     HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
@@ -690,90 +804,290 @@ void DrawPanel(HDC dc, const RECT& rect, COLORREF borderColor)
     SelectObject(dc, oldBrush);
     SelectObject(dc, oldPen);
     DeleteObject(pen);
+    for (const auto& fill : fills) {
+        if (fill.color == backgroundColor)
+            return;
+    }
+    fills.push_back({ backgroundColor, backgroundAlpha });
+}
+
+int TextPixelWidth(HDC dc, const std::wstring& text)
+{
+    if (text.empty()) return 0;
+    SIZE size{};
+    if (!GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size)) return 0;
+    return static_cast<int>(size.cx);
+}
+
+std::vector<std::wstring> WrapLinesToWidth(HDC dc, const std::vector<std::wstring>& source, int maxWidth)
+{
+    std::vector<std::wstring> output;
+    for (const auto& line : source) {
+        if (line.empty()) {
+            output.emplace_back();
+            continue;
+        }
+        size_t offset = 0;
+        while (offset < line.size()) {
+            const int remaining = static_cast<int>(line.size() - offset);
+            int fit = 0;
+            SIZE size{};
+            if (!GetTextExtentExPointW(dc, line.c_str() + offset, remaining, maxWidth, &fit, nullptr, &size))
+                fit = remaining;
+            if (fit <= 0) fit = 1;
+            output.emplace_back(line.substr(offset, static_cast<size_t>(fit)));
+            offset += static_cast<size_t>(fit);
+        }
+    }
+    return output;
+}
+
+void DrawAndRegisterPanel(HDC dc, const RECT& rect, COLORREF bg, BYTE alpha, COLORREF border,
+    std::vector<AlphaFill>& fills)
+{
+    DrawPanel(dc, rect, bg, border, fills, alpha);
+}
+
+void ApplyPerPixelAlpha(DWORD* pixels, int width, int height, const std::vector<AlphaFill>& fills)
+{
+    const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    for (size_t i = 0; i < count; ++i) {
+        const COLORREF color = static_cast<COLORREF>(pixels[i] & 0x00ffffffu);
+        if (color == RGB(0, 0, 0)) {
+            pixels[i] = 0;
+            continue;
+        }
+        const AlphaFill* best = nullptr;
+        int bestDistance = 100000;
+        for (const auto& fill : fills) {
+            const int distance = ColorDistance(color, fill.color);
+            if (distance < bestDistance) { bestDistance = distance; best = &fill; }
+        }
+        BYTE alpha = (best && bestDistance <= 24) ? best->alpha : 255;
+        const BYTE r = GetRValue(color), g = GetGValue(color), b = GetBValue(color);
+        const BYTE pr = static_cast<BYTE>((static_cast<unsigned>(r) * alpha + 127) / 255);
+        const BYTE pg = static_cast<BYTE>((static_cast<unsigned>(g) * alpha + 127) / 255);
+        const BYTE pb = static_cast<BYTE>((static_cast<unsigned>(b) * alpha + 127) / 255);
+        pixels[i] = (static_cast<DWORD>(alpha) << 24) | (static_cast<DWORD>(pr) << 16) |
+            (static_cast<DWORD>(pg) << 8) | static_cast<DWORD>(pb);
+    }
+}
+
+using LayerPainter = void(*)(HDC, std::vector<AlphaFill>&);
+
+void RenderLayerSurface(HWND window, int x, int y, int width, int height,
+    const std::function<void(HDC, std::vector<AlphaFill>&)>& draw)
+{
+    if (!window || width <= 0 || height <= 0)
+        return;
+    HDC screenDc = GetDC(nullptr);
+    if (!screenDc)
+        return;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* rawPixels = nullptr;
+    HBITMAP dib = CreateDIBSection(screenDc, &info, DIB_RGB_COLORS, &rawPixels, nullptr, 0);
+    HDC dc = CreateCompatibleDC(screenDc);
+    if (!dib || !dc || !rawPixels) {
+        if (dib) DeleteObject(dib);
+        if (dc) DeleteDC(dc);
+        ReleaseDC(nullptr, screenDc);
+        return;
+    }
+    HGDIOBJ oldBitmap = SelectObject(dc, dib);
+    std::memset(rawPixels, 0, static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+    SetBkMode(dc, TRANSPARENT);
+    std::vector<AlphaFill> fills;
+    draw(dc, fills);
+    ApplyPerPixelAlpha(static_cast<DWORD*>(rawPixels), width, height, fills);
+
+    POINT destination{ x, y };
+    POINT source{ 0, 0 };
+    SIZE size{ width, height };
+    BLENDFUNCTION blend{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    if (UpdateLayeredWindow(window, screenDc, &destination, &size, dc, &source, 0, &blend, ULW_ALPHA)) {
+        if (!IsWindowVisible(window))
+            ShowWindow(window, SW_SHOWNOACTIVATE);
+        // The warning is always the topmost layer when present.
+        if (window != g_warningWindow && g_warningWindow && IsWindowVisible(g_warningWindow) &&
+            g_tskWarningState != TskWarningState::None) {
+            SetWindowPos(g_warningWindow, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        if (window == g_warningWindow)
+            SetWindowPos(g_warningWindow, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    SelectObject(dc, oldBitmap);
+    DeleteObject(dib);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screenDc);
+}
+
+void PaintInfoLayer(HWND window)
+{
+    const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
+    const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
+    if (!g_haveLastGameClientRect || !g_overlayEnabled || g_infoLines.empty() || gameWidth <= 0 || gameHeight <= 0) {
+        ShowWindow(window, SW_HIDE);
+        return;
+    }
+
+    HDC measureDc = GetDC(nullptr);
+    if (!measureDc) return;
+    HFONT font = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+    HGDIOBJ oldFont = SelectObject(measureDc, font);
+    const int maxPanelWidth = (std::max)(120, (std::min)(gameWidth - 24, 620));
+    const auto lines = WrapLinesToWidth(measureDc, g_infoLines, (std::max)(50, maxPanelWidth - 18));
+    int widest = 0;
+    for (const auto& line : lines) widest = (std::max)(widest, TextPixelWidth(measureDc, line));
+    const int panelWidth = (std::min)(maxPanelWidth, (std::max)(150, widest + 18));
+    int lineHeight = 14;
+    const int availableHeight = (std::max)(40, gameHeight - 16);
+    if (!lines.empty() && static_cast<int>(lines.size()) * lineHeight + 12 > availableHeight)
+        lineHeight = (std::max)(9, (availableHeight - 12) / static_cast<int>(lines.size()));
+    SelectObject(measureDc, oldFont);
+    DeleteObject(font);
+    ReleaseDC(nullptr, measureDc);
+
+    int fontHeight = lineHeight < 14 ? (std::max)(8, lineHeight - 2) : 12;
+    const int panelHeight = static_cast<int>(lines.size()) * lineHeight + 12;
+    int top = 22;
+    if (top + panelHeight > gameHeight - 8) top = (std::max)(8, gameHeight - panelHeight - 8);
+    const int left = 12;
+    const COLORREF background = RGB(8, 8, 12);
+    RenderLayerSurface(window, g_lastGameClientRect.left + left, g_lastGameClientRect.top + top,
+        panelWidth, panelHeight, [=](HDC dc, std::vector<AlphaFill>& fills) {
+            HFONT drawFont = CreateFontW(fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+            RECT panel{ 0, 0, panelWidth, panelHeight };
+            DrawAndRegisterPanel(dc, panel, background, 165, RGB(90, 115, 145), fills);
+            for (size_t i = 0; i < lines.size(); ++i) {
+                const COLORREF color = i == 0 ? RGB(185, 220, 255) : RGB(245, 245, 245);
+                DrawTextLine(dc, lines[i], 8, 5 + static_cast<int>(i) * lineHeight,
+                    panelWidth - 16, lineHeight, color, drawFont);
+            }
+            DeleteObject(drawFont);
+        });
+}
+
+void PaintInputLayer(HWND window)
+{
+    const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
+    const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
+    if (!g_haveLastGameClientRect || !g_inputEnabled || g_sceneId != 2 || g_inputLine.empty() || gameWidth <= 0 || gameHeight <= 0) {
+        ShowWindow(window, SW_HIDE);
+        return;
+    }
+
+    const COLORREF background = RGB(10, 10, 10);
+    const std::wstring help = L"数字・.・: を入力 / Enterでコピー";
+    HDC measureDc = GetDC(nullptr);
+    if (!measureDc) return;
+    HFONT font = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+    HGDIOBJ oldFont = SelectObject(measureDc, font);
+    const int maxPanelWidth = (std::max)(120, (std::min)(gameWidth - 24, 480));
+    const int panelWidth = (std::min)(maxPanelWidth, (std::max)(160,
+        (std::max)(TextPixelWidth(measureDc, g_inputLine), TextPixelWidth(measureDc, help)) + 18));
+    SelectObject(measureDc, oldFont);
+    DeleteObject(font);
+    ReleaseDC(nullptr, measureDc);
+
+    const int panelHeight = 44;
+    const int left = 12;
+    const int top = (std::max)(8, gameHeight - panelHeight - 14);
+    RenderLayerSurface(window, g_lastGameClientRect.left + left, g_lastGameClientRect.top + top,
+        panelWidth, panelHeight, [=](HDC dc, std::vector<AlphaFill>& fills) {
+            HFONT drawFont = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+            RECT panel{ 0, 0, panelWidth, panelHeight };
+            DrawAndRegisterPanel(dc, panel, background, 180, RGB(90, 145, 110), fills);
+            DrawTextLine(dc, g_inputLine, 8, 3, panelWidth - 16, 20, RGB(255, 255, 255), drawFont);
+            DrawTextLine(dc, help, 8, 23, panelWidth - 16, 17, RGB(190, 220, 200), drawFont);
+            DeleteObject(drawFont);
+        });
+}
+
+void PaintWarningLayer(HWND window)
+{
+    const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
+    const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
+    if (!g_haveLastGameClientRect || g_tskWarningState == TskWarningState::None || gameWidth <= 0 || gameHeight <= 0) {
+        ShowWindow(window, SW_HIDE);
+        return;
+    }
+
+    const bool notRunning = g_tskWarningState == TskWarningState::NotRunning;
+    const std::wstring title = notRunning ? L"天則観（tsk.exe）が起動していません！" : L"天則観が非想天則を検知していません";
+    const std::wstring subtitle = notRunning ? L"天則観を起動してから対戦してください" : L"非想天則を再起動してください";
+    const COLORREF flash = g_warningBlink ? RGB(255, 55, 55) : RGB(255, 210, 40);
+    HDC measureDc = GetDC(nullptr);
+    if (!measureDc) return;
+    HFONT titleFont = CreateFontW(26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+    HFONT subtitleFont = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+    HGDIOBJ oldFont = SelectObject(measureDc, titleFont);
+    const int titleWidth = TextPixelWidth(measureDc, title);
+    SelectObject(measureDc, subtitleFont);
+    const int subtitleWidth = TextPixelWidth(measureDc, subtitle);
+    SelectObject(measureDc, oldFont);
+    DeleteObject(subtitleFont);
+    DeleteObject(titleFont);
+    ReleaseDC(nullptr, measureDc);
+
+    const int boxWidth = (std::min)(gameWidth - 20, (std::max)(320, (std::max)(titleWidth, subtitleWidth) + 36));
+    const int boxHeight = 102;
+    const int left = (std::max)(10, (gameWidth - boxWidth) / 2);
+    const int top = (std::max)(10, (gameHeight - boxHeight) / 2);
+    const COLORREF warningBackground = notRunning ? RGB(12, 12, 18) : RGB(14, 14, 22);
+    const BYTE warningAlpha = notRunning ? 255 : 145;
+    RenderLayerSurface(window, g_lastGameClientRect.left + left, g_lastGameClientRect.top + top,
+        boxWidth, boxHeight, [=](HDC dc, std::vector<AlphaFill>& fills) {
+            HFONT tf = CreateFontW(26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+            HFONT sf = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+            RECT panel{ 0, 0, boxWidth, boxHeight };
+            DrawAndRegisterPanel(dc, panel, warningBackground, warningAlpha, flash, fills);
+            DrawTextLine(dc, title, 12, 12, boxWidth - 24, 38, flash, tf,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            DrawTextLine(dc, subtitle, 12, 56, boxWidth - 24, 28, RGB(255, 255, 255), sf,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            DeleteObject(sf);
+            DeleteObject(tf);
+        });
 }
 
 void PaintOverlay(HWND window)
 {
-    PAINTSTRUCT ps{};
-    HDC dc = BeginPaint(window, &ps);
-    RECT client{};
-    GetClientRect(window, &client);
-    HBRUSH clearBrush = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(dc, &client, clearBrush); // RGB(0,0,0) is the transparency key.
-    DeleteObject(clearBrush);
-    SetBkMode(dc, TRANSPARENT);
-
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-
-    if (!g_infoLines.empty() && g_overlayEnabled) {
-        const int panelWidth = std::max(200, std::min(width - 16, 650));
-        const int lineHeight = 15;
-        const int visibleLines = std::min(static_cast<int>(g_infoLines.size()), std::max(1, (height - 40) / lineHeight));
-        const int panelHeight = visibleLines * lineHeight + 12;
-        RECT panel{ 8, 8, 8 + panelWidth, 8 + panelHeight };
-        DrawPanel(dc, panel, RGB(100, 130, 165));
-        HFONT font = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-        for (int i = 0; i < visibleLines; ++i) {
-            const COLORREF color = (i == 0) ? RGB(185, 220, 255) : RGB(245, 245, 245);
-            DrawTextLine(dc, g_infoLines[static_cast<size_t>(i)], panel.left + 8, panel.top + 4 + i * lineHeight,
-                panelWidth - 16, lineHeight, color, font);
-        }
-        DeleteObject(font);
-    }
-
-    if (g_inputEnabled && g_sceneId == 2 && !g_inputLine.empty()) {
-        const int panelWidth = std::max(240, std::min(width - 16, 520));
-        const int y = std::max(8, height - 56);
-        RECT panel{ 8, y, 8 + panelWidth, y + 48 };
-        DrawPanel(dc, panel, RGB(100, 160, 120));
-        HFONT font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-        DrawTextLine(dc, g_inputLine, panel.left + 8, panel.top + 4, panelWidth - 16, 22, RGB(255, 255, 255), font);
-        DrawTextLine(dc, L"数字・.・: を入力 / Enterでコピー（コピー後は空欄）", panel.left + 8, panel.top + 26,
-            panelWidth - 16, 17, RGB(190, 220, 200), font);
-        DeleteObject(font);
-    }
-
-    // This warning is independent of F10 and scene state by design.
-    if (!g_tskRunning) {
-        const int boxWidth = std::min(width - 20, 600);
-        const int boxHeight = 100;
-        const int left = std::max(10, (width - boxWidth) / 2);
-        const int top = std::max(10, (height - boxHeight) / 2);
-        RECT panel{ left, top, left + boxWidth, top + boxHeight };
-        const COLORREF flash = g_warningBlink ? RGB(255, 55, 55) : RGB(255, 210, 40);
-        DrawPanel(dc, panel, flash);
-        HFONT font = CreateFontW(28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-        SetTextColor(dc, flash);
-        HGDIOBJ oldFont = SelectObject(dc, font);
-        RECT line1{ panel.left + 8, panel.top + 12, panel.right - 8, panel.top + 52 };
-        DrawTextW(dc, L"天則観（tsk.exe）が起動していません！", -1, &line1, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        HFONT smallFont = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-        SelectObject(dc, smallFont);
-        RECT line2{ panel.left + 8, panel.top + 56, panel.right - 8, panel.bottom - 8 };
-        DrawTextW(dc, L"天則観を起動してから対戦してください", -1, &line2, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        SelectObject(dc, oldFont);
-        DeleteObject(smallFont);
-        DeleteObject(font);
-    }
-
-    EndPaint(window, &ps);
+    if (window == g_overlayWindow) PaintInfoLayer(window);
+    else if (window == g_inputWindow) PaintInputLayer(window);
+    else if (window == g_warningWindow) PaintWarningLayer(window);
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message) {
-    case WM_PAINT:
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        BeginPaint(window, &ps);
+        EndPaint(window, &ps);
         PaintOverlay(window);
         return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
     case kRefreshMessage:
-        InvalidateRect(window, nullptr, FALSE);
+        PaintOverlay(window);
         return 0;
     case WM_NCHITTEST:
         return HTTRANSPARENT;
@@ -794,27 +1108,45 @@ DWORD WINAPI OverlayThread(void*)
     wc.hInstance = g_module ? g_module : GetModuleHandleW(nullptr);
     wc.lpfnWndProc = OverlayWndProc;
     wc.lpszClassName = kWindowClassName;
-    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // OCR_NORMAL / IDC_ARROW
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
     wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassExW(&wc);
 
-    g_overlayWindow = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        kWindowClassName, L"OIOverlay", WS_POPUP,
-        0, 0, 640, 480, nullptr, nullptr, wc.hInstance, nullptr);
-    if (!g_overlayWindow)
+    const DWORD style = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    auto createLayer = [&](OverlayLayer layer) -> HWND {
+        HWND window = CreateWindowExW(style, kWindowClassName, L"OIOverlay", WS_POPUP,
+            0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+        if (window)
+            SetWindowLongPtrW(window, GWLP_USERDATA, static_cast<LONG_PTR>(layer));
+        return window;
+    };
+    g_overlayWindow = createLayer(OverlayLayer::Info);
+    g_inputWindow = createLayer(OverlayLayer::Input);
+    g_warningWindow = createLayer(OverlayLayer::Warning);
+    if (!g_overlayWindow || !g_inputWindow || !g_warningWindow) {
+        if (g_overlayWindow) DestroyWindow(g_overlayWindow);
+        if (g_inputWindow) DestroyWindow(g_inputWindow);
+        if (g_warningWindow) DestroyWindow(g_warningWindow);
+        g_overlayWindow = g_inputWindow = g_warningWindow = nullptr;
+        UnregisterClassW(kWindowClassName, wc.hInstance);
         return 1;
-    SetLayeredWindowAttributes(g_overlayWindow, RGB(0, 0, 0), 0, LWA_COLORKEY);
+    }
 
+    // Per-pixel transparency is applied by UpdateLayeredWindow, not SetLayeredWindowAttributes.
     g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, wc.hInstance, 0);
     g_databasePath = FindDefaultDatabase();
     if (!g_databasePath.empty())
         g_database = std::make_unique<TskDatabase>(g_databasePath);
+
     g_tskRunning = IsTskRunning();
+    g_tskWarningState = g_tskRunning ? TskWarningState::None : TskWarningState::NotRunning;
     g_lastTskCheck = Clock::now();
     g_lastDbCheck = Clock::now();
-    g_lastStatsRefresh = Clock::time_point{};
     g_lastWarningBlink = Clock::now();
+    g_lastCharacterRefresh = Clock::now();
+    g_lastWindowSearch = Clock::time_point{};
+    g_lastGeometryCheck = Clock::time_point{};
+    RequestRedraw();
 
     while (InterlockedCompareExchange(&g_stopRequested, 0, 0) == 0) {
         MSG message{};
@@ -822,76 +1154,128 @@ DWORD WINAPI OverlayThread(void*)
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        const auto now = Clock::now();
 
-        g_gameWindow = FindGameWindow();
-        const bool foreground = IsGameForeground();
-        if (!g_gameWindow || IsIconic(g_gameWindow) || !foreground) {
-            ShowWindow(g_overlayWindow, SW_HIDE);
-            Sleep(50);
+        if (now - g_lastWindowSearch >= std::chrono::milliseconds(300) || !g_gameWindow) {
+            HWND found = FindGameWindow();
+            if (found != g_gameWindow) {
+                g_gameWindow = found;
+                g_haveLastGameClientRect = false;
+            }
+            g_lastWindowSearch = now;
+        }
+
+        const bool canShow = g_gameWindow && !IsIconic(g_gameWindow) && IsGameForeground();
+        if (!canShow) {
+            if (g_overlayWasVisible) {
+                ShowWindow(g_overlayWindow, SW_HIDE);
+                ShowWindow(g_inputWindow, SW_HIDE);
+                ShowWindow(g_warningWindow, SW_HIDE);
+                g_overlayWasVisible = false;
+            }
+            Sleep(20);
             continue;
         }
-
-        RECT client{};
-        if (GetClientRect(g_gameWindow, &client)) {
-            POINT origin{ client.left, client.top };
-            ClientToScreen(g_gameWindow, &origin);
-            const int width = static_cast<int>((std::max)(static_cast<LONG>(1), client.right - client.left));
-            const int height = static_cast<int>((std::max)(static_cast<LONG>(1), client.bottom - client.top));
-            SetWindowPos(g_overlayWindow, HWND_TOPMOST, origin.x, origin.y, width, height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (!g_overlayWasVisible) {
+            g_overlayWasVisible = true;
+            RequestRedraw();
         }
 
-        const auto now = Clock::now();
-        if (now - g_lastTskCheck >= std::chrono::milliseconds(500)) {
-            g_tskRunning = IsTskRunning();
+        if (now - g_lastGeometryCheck >= std::chrono::milliseconds(100)) {
+            RECT client{};
+            if (GetClientRect(g_gameWindow, &client)) {
+                POINT origin{ client.left, client.top };
+                ClientToScreen(g_gameWindow, &origin);
+                const int w = static_cast<int>((std::max)(static_cast<LONG>(1), static_cast<LONG>(client.right - client.left)));
+                const int h = static_cast<int>((std::max)(static_cast<LONG>(1), static_cast<LONG>(client.bottom - client.top)));
+                const bool changed = !g_haveLastGameClientRect || g_lastLocatedGameWindow != g_gameWindow ||
+                    g_lastGameClientRect.left != origin.x || g_lastGameClientRect.top != origin.y ||
+                    g_lastGameClientRect.right != origin.x + w || g_lastGameClientRect.bottom != origin.y + h;
+                if (changed) {
+                    g_lastGameClientRect = RECT{ origin.x, origin.y, origin.x + w, origin.y + h };
+                    g_lastLocatedGameWindow = g_gameWindow;
+                    g_haveLastGameClientRect = true;
+                    // Layer windows stay independent; re-render their own regions after viewport changes.
+                    RequestRedraw();
+                }
+            }
+            g_lastGeometryCheck = now;
+        }
+
+        if (now - g_lastTskCheck >= std::chrono::milliseconds(300)) {
+            const bool nowRunning = IsTskRunning();
+            if (nowRunning != g_tskRunning) {
+                const bool wasRunning = g_tskRunning;
+                g_tskRunning = nowRunning;
+                g_tskWarningState = !nowRunning ? TskWarningState::NotRunning
+                    : (wasRunning ? TskWarningState::None : TskWarningState::GameNotDetected);
+                g_warningBlink = false;
+                g_lastWarningBlink = now;
+                RequestWarningRedraw();
+            }
             g_lastTskCheck = now;
         }
-        if (now - g_lastDbCheck >= std::chrono::milliseconds(500)) {
-            RefreshDatabase();
-            const bool changed = DatabaseChanged();
-            if (changed)
+
+        const bool sceneChanged = UpdateSceneState();
+        if (sceneChanged) {
+            if ((g_sceneId >= 8 && g_sceneId <= 11) || g_sceneId == 12 || g_sceneId == 15)
                 RefreshStats(true);
-            g_lastDbCheck = now;
+            UpdateInfoText();
+            UpdateInputText();
+            RequestInfoRedraw();
+            RequestInputRedraw();
+            g_lastCharacterRefresh = now;
         }
 
         const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
         if (f10Down && !g_previousF10Down) {
             g_overlayEnabled = !g_overlayEnabled;
             UpdateInfoText();
+            RequestInfoRedraw();
         }
         g_previousF10Down = f10Down;
 
-        UpdateSceneState();
-        if (g_sceneId != 2) {
-            g_inputEnabled = false;
-            g_inputBuffer.clear();
-        } else {
-            g_inputEnabled = true;
+        // Only the information layer refreshes once per second in character-select.
+        // Spectator records are re-read only on SceneID transitions.
+        if (g_sceneId >= 8 && g_sceneId <= 11 &&
+            now - g_lastCharacterRefresh >= std::chrono::seconds(1)) {
+            const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
+            const std::string opponent = ReadProfile(offset);
+            if (!opponent.empty() && opponent != g_opponentProfile) {
+                g_opponentProfile = opponent;
+                g_normalStats = {};
+                g_normalStatsValid = false;
+                g_cachedNormalProfile.clear();
+            }
+            RefreshStats(true);
+            UpdateInfoText();
+            RequestInfoRedraw();
+            g_lastCharacterRefresh = now;
         }
-        if (now - g_lastWarningBlink >= std::chrono::milliseconds(500)) {
+
+        if (now - g_lastDbCheck >= std::chrono::milliseconds(500)) {
+            RefreshDatabase();
+            (void)DatabaseChanged();
+            g_lastDbCheck = now;
+        }
+
+        if (g_tskWarningState != TskWarningState::None &&
+            now - g_lastWarningBlink >= std::chrono::milliseconds(500)) {
             g_warningBlink = !g_warningBlink;
             g_lastWarningBlink = now;
+            RequestWarningRedraw();
         }
-        const bool statsMustRefresh = g_database && (
-            g_cachedNormalProfile != g_opponentProfile ||
-            g_cachedWatchingP1 != g_watchingP1Profile ||
-            g_cachedWatchingP2 != g_watchingP2Profile);
-        RefreshStats(statsMustRefresh);
-        UpdateInfoText();
-        UpdateInputText();
-        InvalidateRect(g_overlayWindow, nullptr, FALSE);
-        UpdateWindow(g_overlayWindow);
-        Sleep(35);
+        Sleep(20);
     }
 
     if (g_keyboardHook) {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
     }
-    if (g_overlayWindow) {
-        DestroyWindow(g_overlayWindow);
-        g_overlayWindow = nullptr;
-    }
+    if (g_overlayWindow) DestroyWindow(g_overlayWindow);
+    if (g_inputWindow) DestroyWindow(g_inputWindow);
+    if (g_warningWindow) DestroyWindow(g_warningWindow);
+    g_overlayWindow = g_inputWindow = g_warningWindow = nullptr;
     UnregisterClassW(kWindowClassName, wc.hInstance);
     return 0;
 }
