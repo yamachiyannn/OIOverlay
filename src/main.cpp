@@ -835,8 +835,8 @@ DWORD WINAPI OverlayThread(void*)
         if (GetClientRect(g_gameWindow, &client)) {
             POINT origin{ client.left, client.top };
             ClientToScreen(g_gameWindow, &origin);
-            const int width = std::max(1, client.right - client.left);
-            const int height = std::max(1, client.bottom - client.top);
+            const int width = static_cast<int>((std::max)(static_cast<LONG>(1), client.right - client.left));
+            const int height = static_cast<int>((std::max)(static_cast<LONG>(1), client.bottom - client.top));
             SetWindowPos(g_overlayWindow, HWND_TOPMOST, origin.x, origin.y, width, height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
