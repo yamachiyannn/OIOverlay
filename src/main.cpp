@@ -1,4 +1,7 @@
 // OIOverlay - OIViewer-style profile/record overlay for Touhou Hisoutensoku.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 // The overlay is a transparent topmost window so it can also work on SceneID 2
 // and can show the TenSokuKan warning even while BattleManager is not active.
 // Default.db is opened READ ONLY. This module never writes to it.
@@ -791,7 +794,7 @@ DWORD WINAPI OverlayThread(void*)
     wc.hInstance = g_module ? g_module : GetModuleHandleW(nullptr);
     wc.lpfnWndProc = OverlayWndProc;
     wc.lpszClassName = kWindowClassName;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // OCR_NORMAL / IDC_ARROW
     wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassExW(&wc);
 

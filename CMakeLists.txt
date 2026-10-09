@@ -165,6 +165,7 @@ target_compile_definitions(
     DIRECTINPUT_VERSION=0x0800
     CURL_STATICLIB
     _CRT_SECURE_NO_WARNINGS
+    NOMINMAX
     $<$<CONFIG:Debug>:_DEBUG>
 )
 
