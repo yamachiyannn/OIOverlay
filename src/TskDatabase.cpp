@@ -53,20 +53,41 @@ std::string WideToUtf8(const std::wstring& text)
 std::string BlobToString(sqlite3_stmt* stmt, int column)
 {
     const unsigned char* blob =
-        static_cast<const unsigned char*>(
-            sqlite3_column_blob(stmt, column)
-        );
-
-    int size =
-        sqlite3_column_bytes(stmt, column);
-
+        static_cast<const unsigned char*>(sqlite3_column_blob(stmt, column));
+    int size = sqlite3_column_bytes(stmt, column);
     if (blob == nullptr || size <= 0)
         return {};
 
-    return std::string(
-        reinterpret_cast<const char*>(blob),
-        static_cast<size_t>(size)
-    );
+    // 天則観のBLOB列はNUL終端や空白を含むことがある。
+    // OIVのReadShiftJisBlobと同じように末尾を正規化して比較する。
+    int actualSize = size;
+    for (int i = 0; i < size; ++i) {
+        if (blob[i] == 0) {
+            actualSize = i;
+            break;
+        }
+    }
+    while (actualSize > 0 &&
+           (blob[actualSize - 1] == ' ' || blob[actualSize - 1] == '\t' ||
+            blob[actualSize - 1] == '\r' || blob[actualSize - 1] == '\n')) {
+        --actualSize;
+    }
+    return std::string(reinterpret_cast<const char*>(blob), static_cast<size_t>(actualSize));
+}
+
+std::string FormatEpochForDisplay(long long epochSeconds, bool oivFileTimeShift)
+{
+    // OIV converts FILETIME to local DateTime and then applies AddHours(-9).
+    // Unix/text timestamps keep their ordinary local-time representation.
+    const long long shift = oivFileTimeShift ? 9LL * 60LL * 60LL : 0LL;
+    const std::time_t adjusted = static_cast<std::time_t>(epochSeconds - shift);
+    std::tm local = {};
+    if (localtime_s(&local, &adjusted) != 0)
+        return {};
+    char buffer[32] = {};
+    if (std::strftime(buffer, sizeof(buffer), "%Y/%m/%d %H:%M:%S", &local) == 0)
+        return {};
+    return buffer;
 }
 
 bool EqualCp932Blob(
@@ -245,27 +266,38 @@ bool IsBeforeToday(
         static_cast<long long>(todayEpoch);
 }
 
-bool IsWithinLastMonth(
-    long long epochSeconds
-)
+bool IsWithinLastMonth(long long epochSeconds)
 {
     if (epochSeconds <= 0)
         return false;
 
-    long long now =
-        NowEpochSeconds();
+    const std::time_t nowTime = std::time(nullptr);
+    std::tm localNow = {};
+    if (localtime_s(&localNow, &nowTime) != 0)
+        return false;
 
-    /*
-     * 30日相当の期間として扱う。
-     * 表示用の「過去1か月」であり、
-     * 元UIの用途と同じく直近期間を示す。
-     */
-    constexpr long long monthSeconds =
-        30LL * 24LL * 60LL * 60LL;
+    // Match OIV's DateTime.Now.AddMonths(-1): subtract a calendar month,
+    // clamping the day for short months (e.g. March 31 -> February 28/29).
+    std::tm threshold = localNow;
+    threshold.tm_mon -= 1;
+    if (threshold.tm_mon < 0) {
+        threshold.tm_mon = 11;
+        threshold.tm_year -= 1;
+    }
+    static const int monthDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int maxDay = monthDays[threshold.tm_mon];
+    const int year = threshold.tm_year + 1900;
+    if (threshold.tm_mon == 1 && IsLeap(year))
+        maxDay = 29;
+    if (threshold.tm_mday > maxDay)
+        threshold.tm_mday = maxDay;
+    threshold.tm_isdst = -1;
+    const std::time_t thresholdTime = std::mktime(&threshold);
+    if (thresholdTime == static_cast<std::time_t>(-1))
+        return false;
 
-    return
-        epochSeconds >= now - monthSeconds &&
-        epochSeconds <= now;
+    return epochSeconds >= static_cast<long long>(thresholdTime) &&
+           epochSeconds <= static_cast<long long>(nowTime);
 }
 
 TskMatchRecord ReadRecord(
@@ -274,23 +306,21 @@ TskMatchRecord ReadRecord(
 {
     TskMatchRecord record;
 
-    const unsigned char* timestamp =
-        sqlite3_column_text(stmt, 0);
+    // Cache the original SQLite type and numeric value before requesting text;
+    // sqlite3_column_text() may convert an INTEGER column to TEXT.
+    const int originalTimestampType = sqlite3_column_type(stmt, 0);
+    const long long originalTimestampValue = originalTimestampType == SQLITE_INTEGER
+        ? sqlite3_column_int64(stmt, 0)
+        : 0LL;
+    bool applyOivFileTimeShift = false;
+    bool formatEpochForDisplay = false;
+
+    const unsigned char* timestamp = sqlite3_column_text(stmt, 0);
 
     if (timestamp != nullptr) {
-        record.timestampText =
-            reinterpret_cast<const char*>(
-                timestamp
-            );
-    }
-    else if (sqlite3_column_type(stmt, 0) ==
-             SQLITE_INTEGER) {
-
-        long long value =
-            sqlite3_column_int64(stmt, 0);
-
-        record.timestampText =
-            std::to_string(value);
+        record.timestampText = reinterpret_cast<const char*>(timestamp);
+    } else if (originalTimestampType == SQLITE_INTEGER) {
+        record.timestampText = std::to_string(originalTimestampValue);
     }
 
     if (!record.timestampText.empty()) {
@@ -304,13 +334,9 @@ TskMatchRecord ReadRecord(
             record.hasParsedTimestamp = true;
 
         }
-        else if (
-            sqlite3_column_type(stmt, 0) ==
-            SQLITE_INTEGER
-        ) {
+        else if (originalTimestampType == SQLITE_INTEGER) {
 
-            long long value =
-                sqlite3_column_int64(stmt, 0);
+            long long value = originalTimestampValue;
 
             /*
              * Unix seconds
@@ -321,6 +347,7 @@ TskMatchRecord ReadRecord(
                 record.epochSeconds = value;
                 record.timestampKey = value;
                 record.hasParsedTimestamp = true;
+                formatEpochForDisplay = true;
 
             }
             /*
@@ -336,6 +363,19 @@ TskMatchRecord ReadRecord(
                     value;
 
                 record.hasParsedTimestamp = true;
+                formatEpochForDisplay = true;
+            }
+            /*
+             * Windows FILETIME (100 ns units since 1601-01-01).
+             * This is the timestamp format used by OIV/天則観 records.
+             */
+            else if (value >= 116444736000000000LL &&
+                     value <= 200000000000000000LL) {
+                record.epochSeconds = value / 10000000LL - 11644473600LL;
+                record.timestampKey = value;
+                record.hasParsedTimestamp = true;
+                applyOivFileTimeShift = true;
+                formatEpochForDisplay = true;
             }
             /*
              * YYYYMMDDHHMMSS
@@ -398,6 +438,12 @@ TskMatchRecord ReadRecord(
                 }
             }
         }
+    }
+
+    if (record.hasParsedTimestamp && formatEpochForDisplay) {
+        const std::string display = FormatEpochForDisplay(record.epochSeconds, applyOivFileTimeShift);
+        if (!display.empty())
+            record.timestampText = display;
     }
 
     record.p1NameCp932 =
