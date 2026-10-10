@@ -1144,7 +1144,6 @@ void PaintInputLayer(HWND window)
 
     const std::wstring help = L"1~9 / . / : / BS / Enter / Ctrl+V";
     const COLORREF background = RGB(10, 10, 10);
-    const std::wstring help = L"数字・.・: / Backspace / Ctrl+V / Enterでコピー";
     HDC measureDc = GetDC(nullptr);
     if (!measureDc) return;
     HFONT font = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
