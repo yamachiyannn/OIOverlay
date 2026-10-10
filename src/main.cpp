@@ -12,6 +12,7 @@
 #include "TskDatabase.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cwchar>
 #include <cwctype>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include <iomanip>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -43,16 +45,17 @@ HWND g_gameWindow = nullptr;
 enum class OverlayLayer : LONG_PTR { Info = 1, Input = 2, Warning = 3 };
 HHOOK g_keyboardHook = nullptr;
 volatile LONG g_stopRequested = 0;
-int g_sceneId = -1;
+std::atomic<int> g_sceneId{-1};
 bool g_clientMode = false;
-bool g_overlayEnabled = true;
-bool g_previousF10Down = false;
+std::atomic<bool> g_overlayEnabled{true};
+bool g_previousProcessF10Down = false;
 bool g_tskRunning = false;
 enum class TskWarningState { None, NotRunning, GameNotDetected };
 TskWarningState g_tskWarningState = TskWarningState::None;
 bool g_warningBlink = false;
-bool g_inputEnabled = false;
+std::atomic<bool> g_inputEnabled{false};
 bool g_suppressedKeys[256]{};
+std::mutex g_inputMutex;
 std::string g_opponentProfile;
 std::string g_watchingP1Profile;
 std::string g_watchingP2Profile;
@@ -73,8 +76,15 @@ bool g_watchP2StatsValid = false;
 std::uintmax_t g_dbSize = 0;
 FILETIME g_dbWriteTime{};
 RECT g_lastGameClientRect{};
+RECT g_lastGameWindowRect{};
+LONG_PTR g_lastGameWindowStyle = 0;
+LONG_PTR g_lastGameWindowExStyle = 0;
 HWND g_lastLocatedGameWindow = nullptr;
 bool g_haveLastGameClientRect = false;
+struct LayerBounds { int offsetX = 0; int offsetY = 0; int width = 0; int height = 0; bool valid = false; };
+LayerBounds g_infoLayerBounds;
+LayerBounds g_inputLayerBounds;
+LayerBounds g_warningLayerBounds;
 bool g_overlayWasVisible = false;
 
 using Clock = std::chrono::steady_clock;
@@ -85,6 +95,9 @@ Clock::time_point g_lastWarningBlink{};
 Clock::time_point g_lastCharacterRefresh{};
 Clock::time_point g_lastWindowSearch{};
 Clock::time_point g_lastGeometryCheck{};
+Clock::time_point g_lastKeyboardHookCheck{};
+
+static int (SokuLib::BattleManager::*g_originalBattleManagerOnProcess)() = nullptr;
 
 void RequestWindowRedraw(HWND window);
 void RequestInfoRedraw();
@@ -165,21 +178,43 @@ bool IsTskRunning()
     return found;
 }
 
-int ReadSceneId()
+// Read game-owned memory through the OS API rather than directly dereferencing a
+// game pointer. During spectator-to-match transitions the game can temporarily
+// replace these objects; an unreadable address must not crash th123.exe.
+bool TryReadGameMemory(uintptr_t address, void* destination, size_t size)
 {
-    return *reinterpret_cast<volatile int*>(kSceneIdAddress);
+    if (address < 0x10000 || !destination || size == 0)
+        return false;
+    SIZE_T bytesRead = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address),
+        destination, size, &bytesRead) != FALSE && bytesRead == size;
+}
+
+bool TryReadSceneId(int& scene)
+{
+    int value = -1;
+    if (!TryReadGameMemory(kSceneIdAddress, &value, sizeof(value)))
+        return false;
+    // Hisoutensoku's scene IDs used by this module are in the range 0..15.
+    // Ignore transient garbage rather than treating it as a real transition.
+    if (value < 0 || value > 31)
+        return false;
+    scene = value;
+    return true;
 }
 
 std::string ReadProfile(uintptr_t offset)
 {
-    const uint32_t networkObject = *reinterpret_cast<volatile uint32_t*>(kPNetObjectAddress);
-    if (networkObject == 0)
+    uint32_t networkObject = 0;
+    if (!TryReadGameMemory(kPNetObjectAddress, &networkObject, sizeof(networkObject)))
+        return {};
+    // The target is a 32-bit game; reject null and obviously invalid pointers.
+    if (networkObject < 0x10000 || networkObject > 0x7fff0000u)
         return {};
     const uintptr_t address = static_cast<uintptr_t>(networkObject) + offset;
-    if (IsBadReadPtr(reinterpret_cast<const void*>(address), kProfileSize))
-        return {};
     char buffer[kProfileSize + 1]{};
-    std::memcpy(buffer, reinterpret_cast<const void*>(address), kProfileSize);
+    if (!TryReadGameMemory(address, buffer, kProfileSize))
+        return {};
     buffer[kProfileSize] = '\0';
     std::string result(buffer);
     while (!result.empty() && (result.back() == '\0' || result.back() == ' ' || result.back() == '\t'))
@@ -385,7 +420,7 @@ void SetClipboardText(const std::string& text)
     }
     std::memcpy(target, wide.c_str(), wide.size() * sizeof(wchar_t));
     GlobalUnlock(memory);
-    if (!OpenClipboard(g_gameWindow)) {
+    if (!OpenClipboard(nullptr)) {
         GlobalFree(memory);
         return;
     }
@@ -405,16 +440,67 @@ bool IsGameForeground()
     return processId == GetCurrentProcessId();
 }
 
+bool IsAltDown()
+{
+    return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
+}
+
+bool IsControlDown()
+{
+    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+}
+
+bool KeyPressed(int vk)
+{
+    // Follow the known-working 5a8b46b implementation: use the transition bit
+    // from GetAsyncKeyState once from BattleManager::onProcess.
+    return (GetAsyncKeyState(vk) & 1) != 0;
+}
+
+std::string GetInputBufferSnapshot()
+{
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    return g_inputBuffer;
+}
+
+void ClearInputBuffer()
+{
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_inputBuffer.clear();
+}
+
 void AppendIpCharacter(char character)
 {
     constexpr size_t kMaximumInputLength = 64;
+    std::lock_guard<std::mutex> lock(g_inputMutex);
     if (g_inputBuffer.size() < kMaximumInputLength)
         g_inputBuffer.push_back(character);
 }
 
+void RemoveLastIpCharacter()
+{
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    if (!g_inputBuffer.empty())
+        g_inputBuffer.pop_back();
+}
+
+void CopyInputToClipboardAndClear()
+{
+    std::string value;
+    {
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        value.swap(g_inputBuffer);
+    }
+    SetClipboardText(value);
+}
+
 bool PasteClipboardIp()
 {
-    if (!OpenClipboard(g_overlayWindow))
+    if (!OpenClipboard(nullptr))
         return false;
 
     HANDLE clipboardData = GetClipboardData(CF_UNICODETEXT);
@@ -433,7 +519,6 @@ bool PasteClipboardIp()
     GlobalUnlock(clipboardData);
     CloseClipboard();
 
-    // IP:Port欄への貼り付けは数字・ピリオド・コロンだけを受け付ける。
     size_t first = 0;
     while (first < value.size() && iswspace(value[first])) ++first;
     size_t last = value.size();
@@ -452,6 +537,7 @@ bool PasteClipboardIp()
     }
 
     constexpr size_t kMaximumInputLength = 64;
+    std::lock_guard<std::mutex> lock(g_inputMutex);
     if (g_inputBuffer.size() + normalized.size() > kMaximumInputLength)
         return false;
     g_inputBuffer += normalized;
@@ -460,40 +546,12 @@ bool PasteClipboardIp()
 
 bool IsAltPressed(const KBDLLHOOKSTRUCT& key)
 {
-    return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 || (key.flags & LLKHF_ALTDOWN) != 0;
-}
-
-bool IsControlPressed()
-{
-    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    return IsAltDown() || (key.flags & LLKHF_ALTDOWN) != 0;
 }
 
 bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
 {
-    // Translate through the active Windows keyboard layout so punctuation works
-    // on Japanese/JIS keyboards instead of relying on only US virtual-key codes.
-    BYTE state[256]{};
-    if (GetKeyboardState(state)) {
-        state[vk] |= 0x80;
-        if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) state[VK_SHIFT] |= 0x80;
-        else state[VK_SHIFT] &= 0x7f;
-        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) state[VK_CONTROL] |= 0x80;
-        if (IsAltPressed(key)) state[VK_MENU] |= 0x80;
-        wchar_t translated[8]{};
-        const int count = ToUnicodeEx(vk, key.scanCode, state, translated,
-            static_cast<int>(_countof(translated)), 0, GetKeyboardLayout(0));
-        if (count == 1) {
-            const wchar_t c = translated[0];
-            if ((c >= L'0' && c <= L'9') || c == L'.' || c == L':') {
-                result = static_cast<char>(c);
-                return true;
-            }
-        }
-    }
-
-    // Fallbacks cover numpad digits and punctuation mappings when translation fails.
-    if (vk >= '0' && vk <= '9' && (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0 &&
-        !IsControlPressed() && !IsAltPressed(key)) {
+    if (vk >= '0' && vk <= '9' && (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0) {
         result = static_cast<char>(vk);
         return true;
     }
@@ -505,6 +563,27 @@ bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
         result = '.';
         return true;
     }
+
+    BYTE state[256]{};
+    if (GetKeyboardState(state)) {
+        state[vk] |= 0x80;
+        if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) state[VK_SHIFT] |= 0x80;
+        else state[VK_SHIFT] &= 0x7f;
+        if (IsControlDown()) state[VK_CONTROL] |= 0x80;
+        if (IsAltPressed(key)) state[VK_MENU] |= 0x80;
+        wchar_t translated[8]{};
+        const UINT scan = key.scanCode ? key.scanCode : MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        const int count = ToUnicodeEx(vk, scan, state, translated,
+            static_cast<int>(_countof(translated)), 0, GetKeyboardLayout(0));
+        if (count == 1) {
+            const wchar_t c = translated[0];
+            if ((c >= L'0' && c <= L'9') || c == L'.' || c == L':') {
+                result = static_cast<char>(c);
+                return true;
+            }
+        }
+    }
+
     if (vk == VK_OEM_PERIOD && (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0) {
         result = '.';
         return true;
@@ -514,6 +593,52 @@ bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
         return true;
     }
     return false;
+}
+
+void PollMenuInput(int scene)
+{
+    if (scene != 2 || !IsGameForeground())
+        return;
+
+    // Alt+Enter is owned by the vanilla game. Do not consume it or copy text.
+    if (IsAltDown())
+        return;
+
+    bool changed = false;
+    if (!IsControlDown() && KeyPressed(VK_BACK)) {
+        RemoveLastIpCharacter();
+        changed = true;
+    }
+
+    if (IsControlDown() && KeyPressed('V')) {
+        changed = PasteClipboardIp() || changed;
+    } else if (KeyPressed(VK_RETURN)) {
+        CopyInputToClipboardAndClear();
+        changed = true;
+    } else if (!IsControlDown()) {
+        // Number row, numpad, decimal key, and JIS/Windows-layout punctuation.
+        const int keys[] = {
+            '0','1','2','3','4','5','6','7','8','9',
+            VK_NUMPAD0,VK_NUMPAD1,VK_NUMPAD2,VK_NUMPAD3,VK_NUMPAD4,
+            VK_NUMPAD5,VK_NUMPAD6,VK_NUMPAD7,VK_NUMPAD8,VK_NUMPAD9,
+            VK_DECIMAL,VK_OEM_PERIOD,VK_OEM_1,VK_OEM_PLUS
+        };
+        for (int vk : keys) {
+            if (!KeyPressed(vk))
+                continue;
+            KBDLLHOOKSTRUCT key{};
+            key.vkCode = static_cast<DWORD>(vk);
+            key.scanCode = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+            char character = 0;
+            if (TryGetIpCharacter(static_cast<DWORD>(vk), key, character)) {
+                AppendIpCharacter(character);
+                changed = true;
+            }
+        }
+    }
+
+    if (changed)
+        RequestInputRedraw();
 }
 
 LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
@@ -526,7 +651,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
     const bool isDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
     const bool isUp = message == WM_KEYUP || message == WM_SYSKEYUP;
 
-    // Consume the key-up matching any intercepted key-down, even after a scene change.
     if (isUp && vk < _countof(g_suppressedKeys) && g_suppressedKeys[vk]) {
         g_suppressedKeys[vk] = false;
         return 1;
@@ -534,37 +658,23 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
     if (!isDown || !g_inputEnabled || g_sceneId != 2 || !IsGameForeground())
         return CallNextHookEx(g_keyboardHook, code, message, data);
 
-    bool consume = false;
-    if (vk == VK_RETURN) {
-        // Alt+Enter must reach the vanilla game to toggle fullscreen.
-        if (IsAltPressed(key))
-            return CallNextHookEx(g_keyboardHook, code, message, data);
-        SetClipboardText(g_inputBuffer);
-        g_inputBuffer.clear();
-        UpdateInputText();
-        consume = true;
-    } else if (vk == VK_BACK && !IsAltPressed(key) && !IsControlPressed()) {
-        if (!g_inputBuffer.empty()) g_inputBuffer.pop_back();
-        UpdateInputText();
-        consume = true;
-    } else if (vk == 'V' && IsControlPressed() && !IsAltPressed(key)) {
-        PasteClipboardIp();
-        UpdateInputText();
-        consume = true;
-    } else if (!IsAltPressed(key) && !IsControlPressed()) {
-        char character = 0;
-        if (TryGetIpCharacter(vk, key, character)) {
-            AppendIpCharacter(character);
-            UpdateInputText();
-            consume = true;
-        }
-    }
-
-    if (!consume)
+    // Alt+Enter must pass to the game so the built-in fullscreen toggle works.
+    if (vk == VK_RETURN && IsAltPressed(key))
         return CallNextHookEx(g_keyboardHook, code, message, data);
-    if (vk < _countof(g_suppressedKeys)) g_suppressedKeys[vk] = true;
-    RequestInputRedraw();
-    return 1;
+
+    // Keep modifier state visible to GetAsyncKeyState and the keyboard layout.
+    if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+        vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+        vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
+        return CallNextHookEx(g_keyboardHook, code, message, data);
+
+    // Input is polled from BattleManager::onProcess; this hook only keeps typed
+    // keys from activating the vanilla menu while SceneID 2 is active.
+    if (vk < _countof(g_suppressedKeys)) {
+        g_suppressedKeys[vk] = true;
+        return 1;
+    }
+    return CallNextHookEx(g_keyboardHook, code, message, data);
 }
 
 BOOL CALLBACK FindGameWindowCallback(HWND window, LPARAM parameter)
@@ -672,7 +782,9 @@ void RefreshStats(bool force)
 
 bool UpdateSceneState()
 {
-    const int scene = ReadSceneId();
+    int scene = -1;
+    if (!TryReadSceneId(scene))
+        return false;
     if (scene == g_sceneId)
         return false;
 
@@ -691,10 +803,10 @@ bool UpdateSceneState()
 
     // SceneID 2 only. Any transition out clears the pending input immediately.
     if (scene == 2) {
-        g_inputBuffer.clear();
+        ClearInputBuffer();
         g_inputEnabled = true;
     } else {
-        g_inputBuffer.clear();
+        ClearInputBuffer();
         g_inputEnabled = false;
     }
 
@@ -740,6 +852,34 @@ void RequestInfoRedraw() { RequestWindowRedraw(g_overlayWindow); }
 void RequestInputRedraw() { RequestWindowRedraw(g_inputWindow); }
 void RequestWarningRedraw() { RequestWindowRedraw(g_warningWindow); }
 
+void RepositionVisibleLayer(HWND window, const LayerBounds& bounds)
+{
+    if (!window || !bounds.valid || !IsWindowVisible(window) || !g_haveLastGameClientRect)
+        return;
+    SetWindowPos(window, nullptr,
+        g_lastGameClientRect.left + bounds.offsetX,
+        g_lastGameClientRect.top + bounds.offsetY,
+        bounds.width, bounds.height,
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+}
+
+void RaiseOverlayLayers()
+{
+    // Keep each surface attached to the game's client area even when Alt+Enter
+    // changes the display mode between content redraws.
+    RepositionVisibleLayer(g_overlayWindow, g_infoLayerBounds);
+    RepositionVisibleLayer(g_inputWindow, g_inputLayerBounds);
+    RepositionVisibleLayer(g_warningWindow, g_warningLayerBounds);
+
+    const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    if (g_overlayWindow && IsWindow(g_overlayWindow))
+        SetWindowPos(g_overlayWindow, HWND_TOPMOST, 0, 0, 0, 0, flags);
+    if (g_inputWindow && IsWindow(g_inputWindow))
+        SetWindowPos(g_inputWindow, HWND_TOPMOST, 0, 0, 0, 0, flags);
+    if (g_warningWindow && IsWindow(g_warningWindow))
+        SetWindowPos(g_warningWindow, HWND_TOPMOST, 0, 0, 0, 0, flags);
+}
+
 void RequestRedraw()
 {
     RequestInfoRedraw();
@@ -764,7 +904,7 @@ void UpdateInputText()
 {
     std::wstring next;
     if (g_inputEnabled && g_sceneId == 2)
-        next = L"IP:Port ＞ " + NarrowAsciiToWide(g_inputBuffer) + L"_";
+        next = L"IP:Port ＞ " + NarrowAsciiToWide(GetInputBufferSnapshot()) + L"_";
     if (next != g_inputLine)
         g_inputLine = std::move(next);
 }
@@ -911,17 +1051,29 @@ void RenderLayerSurface(HWND window, int x, int y, int width, int height,
     SIZE size{ width, height };
     BLENDFUNCTION blend{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
     if (UpdateLayeredWindow(window, screenDc, &destination, &size, dc, &source, 0, &blend, ULW_ALPHA)) {
+        LayerBounds* savedBounds = nullptr;
+        if (window == g_overlayWindow) savedBounds = &g_infoLayerBounds;
+        else if (window == g_inputWindow) savedBounds = &g_inputLayerBounds;
+        else if (window == g_warningWindow) savedBounds = &g_warningLayerBounds;
+        if (savedBounds && g_haveLastGameClientRect) {
+            savedBounds->offsetX = x - g_lastGameClientRect.left;
+            savedBounds->offsetY = y - g_lastGameClientRect.top;
+            savedBounds->width = width;
+            savedBounds->height = height;
+            savedBounds->valid = true;
+        }
         if (!IsWindowVisible(window))
             ShowWindow(window, SW_SHOWNOACTIVATE);
-        // The warning is always the topmost layer when present.
+        // Alt+Enter / fullscreen transitions can disturb the Z-order of
+        // non-activating layered windows. Reassert this layer's topmost status
+        // whenever it is redrawn; if the warning is active, put it back on top.
+        SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         if (window != g_warningWindow && g_warningWindow && IsWindowVisible(g_warningWindow) &&
             g_tskWarningState != TskWarningState::None) {
             SetWindowPos(g_warningWindow, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
-        if (window == g_warningWindow)
-            SetWindowPos(g_warningWindow, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
     SelectObject(dc, oldBitmap);
@@ -982,13 +1134,15 @@ void PaintInputLayer(HWND window)
 {
     const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
     const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
-    if (!g_haveLastGameClientRect || !g_inputEnabled || g_sceneId != 2 || g_inputLine.empty() || gameWidth <= 0 || gameHeight <= 0) {
+    if (!g_haveLastGameClientRect || !g_inputEnabled || g_sceneId != 2 || gameWidth <= 0 || gameHeight <= 0) {
         ShowWindow(window, SW_HIDE);
         return;
     }
 
     const COLORREF background = RGB(10, 10, 10);
-    const std::wstring help = L"数字・.・: を入力 / Enterでコピー";
+    const std::wstring help = g_keyboardHook
+        ? L"数字・.・: / Backspace / Ctrl+V / Enterでコピー"
+        : L"キー入力の抑止を初期化中（入力処理は継続）";
     HDC measureDc = GetDC(nullptr);
     if (!measureDc) return;
     HFONT font = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
@@ -1087,6 +1241,10 @@ LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM
     case WM_ERASEBKGND:
         return 1;
     case kRefreshMessage:
+        if (window == g_inputWindow)
+            UpdateInputText();
+        else if (window == g_overlayWindow)
+            UpdateInfoText();
         PaintOverlay(window);
         return 0;
     case WM_NCHITTEST:
@@ -1099,6 +1257,63 @@ LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM
     default:
         return DefWindowProcW(window, message, wParam, lParam);
     }
+}
+
+int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
+{
+    // Poll F10 on the game frame as well, so the key is not missed while the
+    // overlay thread is sleeping between its 35ms window-placement checks.
+    const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (f10Down && !g_previousProcessF10Down) {
+        g_overlayEnabled.store(!g_overlayEnabled.load());
+        RequestInfoRedraw();
+    }
+    g_previousProcessF10Down = f10Down;
+
+    int scene = -1;
+    if (TryReadSceneId(scene))
+        PollMenuInput(scene);
+
+    if (g_originalBattleManagerOnProcess)
+        return (self->*g_originalBattleManagerOnProcess)();
+    return 0;
+}
+
+bool InstallBattleManagerProcessHook()
+{
+    void* slot = static_cast<void*>(&SokuLib::VTable_BattleManager.onProcess);
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(slot, sizeof(DWORD), PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        OutputDebugStringW(L"[OIOverlay] Could not make BattleManager::onProcess writable.\n");
+        return false;
+    }
+
+    g_originalBattleManagerOnProcess = SokuLib::TamperDword(
+        &SokuLib::VTable_BattleManager.onProcess, HookBattleManagerOnProcess);
+
+    DWORD ignored = 0;
+    VirtualProtect(slot, sizeof(DWORD), oldProtection, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(DWORD));
+    if (!g_originalBattleManagerOnProcess) {
+        OutputDebugStringW(L"[OIOverlay] BattleManager::onProcess hook failed.\n");
+        return false;
+    }
+    return true;
+}
+
+bool InstallKeyboardHook()
+{
+    if (g_keyboardHook)
+        return true;
+    SetLastError(ERROR_SUCCESS);
+    HMODULE hookModule = g_module ? g_module : GetModuleHandleW(nullptr);
+    HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hookModule, 0);
+    if (!hook) {
+        OutputDebugStringW(L"[OIOverlay] WH_KEYBOARD_LL install failed; will retry.\n");
+        return false;
+    }
+    g_keyboardHook = hook;
+    return true;
 }
 
 DWORD WINAPI OverlayThread(void*)
@@ -1133,7 +1348,10 @@ DWORD WINAPI OverlayThread(void*)
     }
 
     // Per-pixel transparency is applied by UpdateLayeredWindow, not SetLayeredWindowAttributes.
-    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, wc.hInstance, 0);
+    // The low-level hook suppresses ordinary menu keys in SceneID 2. Actual IP text
+    // input is polled by BattleManager::onProcess using GetAsyncKeyState; Alt+Enter passes through.
+    InstallKeyboardHook();
+    g_lastKeyboardHookCheck = Clock::now();
     g_databasePath = FindDefaultDatabase();
     if (!g_databasePath.empty())
         g_database = std::make_unique<TskDatabase>(g_databasePath);
@@ -1156,7 +1374,7 @@ DWORD WINAPI OverlayThread(void*)
         }
         const auto now = Clock::now();
 
-        if (now - g_lastWindowSearch >= std::chrono::milliseconds(300) || !g_gameWindow) {
+        if (now - g_lastWindowSearch >= std::chrono::milliseconds(35) || !g_gameWindow) {
             HWND found = FindGameWindow();
             if (found != g_gameWindow) {
                 g_gameWindow = found;
@@ -1173,7 +1391,7 @@ DWORD WINAPI OverlayThread(void*)
                 ShowWindow(g_warningWindow, SW_HIDE);
                 g_overlayWasVisible = false;
             }
-            Sleep(20);
+            Sleep(35);
             continue;
         }
         if (!g_overlayWasVisible) {
@@ -1181,25 +1399,43 @@ DWORD WINAPI OverlayThread(void*)
             RequestRedraw();
         }
 
-        if (now - g_lastGeometryCheck >= std::chrono::milliseconds(100)) {
+        if (now - g_lastGeometryCheck >= std::chrono::milliseconds(35)) {
             RECT client{};
-            if (GetClientRect(g_gameWindow, &client)) {
+            RECT windowRect{};
+            if (GetClientRect(g_gameWindow, &client) && GetWindowRect(g_gameWindow, &windowRect)) {
                 POINT origin{ client.left, client.top };
                 ClientToScreen(g_gameWindow, &origin);
                 const int w = static_cast<int>((std::max)(static_cast<LONG>(1), static_cast<LONG>(client.right - client.left)));
                 const int h = static_cast<int>((std::max)(static_cast<LONG>(1), static_cast<LONG>(client.bottom - client.top)));
+                const LONG_PTR windowStyle = GetWindowLongPtrW(g_gameWindow, GWL_STYLE);
+                const LONG_PTR windowExStyle = GetWindowLongPtrW(g_gameWindow, GWL_EXSTYLE);
                 const bool changed = !g_haveLastGameClientRect || g_lastLocatedGameWindow != g_gameWindow ||
                     g_lastGameClientRect.left != origin.x || g_lastGameClientRect.top != origin.y ||
-                    g_lastGameClientRect.right != origin.x + w || g_lastGameClientRect.bottom != origin.y + h;
+                    g_lastGameClientRect.right != origin.x + w || g_lastGameClientRect.bottom != origin.y + h ||
+                    g_lastGameWindowRect.left != windowRect.left || g_lastGameWindowRect.top != windowRect.top ||
+                    g_lastGameWindowRect.right != windowRect.right || g_lastGameWindowRect.bottom != windowRect.bottom ||
+                    g_lastGameWindowStyle != windowStyle || g_lastGameWindowExStyle != windowExStyle;
                 if (changed) {
                     g_lastGameClientRect = RECT{ origin.x, origin.y, origin.x + w, origin.y + h };
+                    g_lastGameWindowRect = windowRect;
+                    g_lastGameWindowStyle = windowStyle;
+                    g_lastGameWindowExStyle = windowExStyle;
                     g_lastLocatedGameWindow = g_gameWindow;
                     g_haveLastGameClientRect = true;
-                    // Layer windows stay independent; re-render their own regions after viewport changes.
+                    // A mode/style/position change is a real viewport event; re-render each independent layer.
                     RequestRedraw();
                 }
             }
+            // Match the earlier working overlay's fast placement cadence. The three
+            // layers stay independent; only their Z-order is touched on stable frames.
+            RaiseOverlayLayers();
             g_lastGeometryCheck = now;
+        }
+
+        if (now - g_lastKeyboardHookCheck >= std::chrono::seconds(2)) {
+            if (!g_keyboardHook && InstallKeyboardHook())
+                RequestInputRedraw();
+            g_lastKeyboardHookCheck = now;
         }
 
         if (now - g_lastTskCheck >= std::chrono::milliseconds(300)) {
@@ -1226,14 +1462,6 @@ DWORD WINAPI OverlayThread(void*)
             RequestInputRedraw();
             g_lastCharacterRefresh = now;
         }
-
-        const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-        if (f10Down && !g_previousF10Down) {
-            g_overlayEnabled = !g_overlayEnabled;
-            UpdateInfoText();
-            RequestInfoRedraw();
-        }
-        g_previousF10Down = f10Down;
 
         // Only the information layer refreshes once per second in character-select.
         // Spectator records are re-read only on SceneID transitions.
@@ -1265,7 +1493,7 @@ DWORD WINAPI OverlayThread(void*)
             g_lastWarningBlink = now;
             RequestWarningRedraw();
         }
-        Sleep(20);
+        Sleep(35);
     }
 
     if (g_keyboardHook) {
@@ -1290,6 +1518,8 @@ extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16])
 extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE)
 {
     g_module = hMyModule;
+    if (!InstallBattleManagerProcessHook())
+        return false;
     HANDLE thread = CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
     if (!thread)
         return false;
