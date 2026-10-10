@@ -335,12 +335,20 @@ std::wstring WatchingPlayerText(const wchar_t* side, const std::string& profile,
     return text;
 }
 
+// OIV Form1's normal-match overlay is visible only during character select/loading.
+// Scenes 13-14 are deliberately excluded; spectator scenes are handled separately.
+bool IsNormalInfoScene(int scene)
+{
+    return scene >= 8 && scene <= 11;
+}
+
 std::wstring BuildNormalInfo()
 {
+    // Keep the visible text in sync with Form1.ShowOpponentInfo.
     if (g_opponentProfile.empty())
-        return L"【キャラセレ中】\n\n対戦相手を取得中...";
+        return L"【対戦中】\n\n対戦相手を取得中...";
 
-    std::wstring text = L"【キャラセレ中】\n\n対戦相手 : " + Cp932ToWide(g_opponentProfile) + L"\n";
+    std::wstring text = L"【対戦中】\n\n対戦相手 : " + Cp932ToWide(g_opponentProfile) + L"\n";
     if (!g_normalStatsValid || !g_normalStats.found) {
         text += L"\n対戦記録がありません";
         return text;
@@ -812,7 +820,7 @@ bool UpdateSceneState()
             g_watchP2StatsValid = false;
             g_cachedWatchingP2.clear();
         }
-    } else if (scene >= 8 && scene <= 14) {
+    } else if (scene >= 8 && scene <= 11) {
         const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
         const std::string opponent = ReadProfile(offset);
         if (opponent != g_opponentProfile) {
@@ -877,7 +885,7 @@ void UpdateInfoText()
 {
     std::vector<std::wstring> next;
     if (g_overlayEnabled) {
-        if (g_sceneId >= 8 && g_sceneId <= 11)
+        if (IsNormalInfoScene(g_sceneId))
             SplitLines(BuildNormalInfo(), next);
         else if (g_sceneId == 12 || g_sceneId == 15)
             SplitLines(BuildWatchingInfo(), next);
@@ -1079,6 +1087,10 @@ void RenderLayerSurface(HWND window, int x, int y, int width, int height,
 
 void PaintInfoLayer(HWND window)
 {
+    // WM_PAINT can occur independently of our posted refresh message. Rebuild
+    // the same info text used by both normal and spectator views here as well,
+    // so entering SceneID 8-11 cannot leave the info layer with stale/empty lines.
+    UpdateInfoText();
     const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
     const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
     if (!g_haveLastGameClientRect || !g_overlayEnabled || g_infoLines.empty() || gameWidth <= 0 || gameHeight <= 0) {
@@ -1106,7 +1118,8 @@ void PaintInfoLayer(HWND window)
 
     int fontHeight = lineHeight < 14 ? (std::max)(8, lineHeight - 2) : 12;
     const int panelHeight = static_cast<int>(lines.size()) * lineHeight + 12;
-    int top = 22;
+    // Center the information window vertically rather than keeping it near the top third.
+    int top = (std::max)(22, (gameHeight - panelHeight) / 2);
     if (top + panelHeight > gameHeight - 8) top = (std::max)(8, gameHeight - panelHeight - 8);
     const int left = 12;
     const COLORREF background = RGB(8, 8, 12);
@@ -1513,7 +1526,7 @@ DWORD WINAPI OverlayThread(void*)
 
         const bool sceneChanged = UpdateSceneState();
         if (sceneChanged) {
-            if ((g_sceneId >= 8 && g_sceneId <= 11) || g_sceneId == 12 || g_sceneId == 15)
+            if (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15)
                 RefreshStats(true);
             UpdateInfoText();
             UpdateInputText();
@@ -1529,8 +1542,8 @@ DWORD WINAPI OverlayThread(void*)
 
         // Only the information layer refreshes once per second in character-select.
         // Spectator records are re-read only on SceneID transitions.
-        if (g_sceneId >= 8 && g_sceneId <= 11 &&
-            now - g_lastCharacterRefresh >= std::chrono::seconds(1)) {
+        if (g_overlayEnabled && IsNormalInfoScene(g_sceneId) &&
+            (g_infoLines.empty() || now - g_lastCharacterRefresh >= std::chrono::seconds(1))) {
             const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
             const std::string opponent = ReadProfile(offset);
             if (!opponent.empty() && opponent != g_opponentProfile) {
