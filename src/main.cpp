@@ -54,7 +54,7 @@ enum class TskWarningState { None, NotRunning, GameNotDetected };
 TskWarningState g_tskWarningState = TskWarningState::None;
 bool g_warningBlink = false;
 std::atomic<bool> g_inputEnabled{false};
-bool g_suppressedKeys[256]{};
+bool g_previousPolledKeyDown[256]{};
 std::mutex g_inputMutex;
 std::string g_opponentProfile;
 std::string g_watchingP1Profile;
@@ -71,6 +71,8 @@ std::wstring g_inputLine;
 // low-level keyboard callback and the overlay window thread.
 std::atomic<unsigned long long> g_inputHookEvents{0};
 std::atomic<DWORD> g_inputLastVirtualKey{0};
+std::atomic<unsigned long long> g_inputPollEvents{0};
+std::atomic<DWORD> g_inputLastPolledVirtualKey{0};
 std::atomic<int> g_clipboardStatus{-1};
 std::atomic<int> g_pasteStatus{-1};
 std::atomic<DWORD> g_clipboardError{ERROR_SUCCESS};
@@ -634,72 +636,18 @@ bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
 
 LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
 {
-    if (code < 0 || data == 0)
-        return CallNextHookEx(g_keyboardHook, code, message, data);
-
-    const auto& key = *reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
-    const DWORD vk = key.vkCode;
-    const bool isDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-    const bool isUp = message == WM_KEYUP || message == WM_SYSKEYUP;
-
-    // Consume key-up only when its corresponding key-down was consumed here.
-    if (isUp && vk < _countof(g_suppressedKeys) && g_suppressedKeys[vk]) {
-        g_suppressedKeys[vk] = false;
-        return 1;
-    }
-    if (!isDown || !g_inputEnabled || g_sceneId != 2)
-        return CallNextHookEx(g_keyboardHook, code, message, data);
-
-    // Count keys reaching the hook before the foreground gate, so the diagnostic
-    // distinguishes a dead hook from an incorrect focus condition.
-    g_inputHookEvents.fetch_add(1);
-    g_inputLastVirtualKey.store(vk);
-    if (!IsGameForeground())
-        return CallNextHookEx(g_keyboardHook, code, message, data);
-
-    // Alt+Enter belongs to the game. Modifier keys must pass so Windows can
-    // maintain modifier state, and F10 remains available to the overlay hotkey.
-    if ((vk == VK_RETURN && IsAltPressed(key)) || vk == VK_F10 ||
-        vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
-        vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
-        vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
-        return CallNextHookEx(g_keyboardHook, code, message, data);
-
-    bool handled = false;
-    if (vk == VK_RETURN) {
-        CopyInputToClipboardAndClear();
-        handled = true;
-    } else if (IsControlDown() && vk == 'V') {
-        g_pasteStatus.store(PasteClipboardIp() ? 1 : 2);
-        handled = true;
-    } else if (IsControlDown()) {
-        // Do not leak other Ctrl shortcuts into the game's menu while entering an IP.
-        handled = true;
-    } else if (vk == VK_BACK) {
-        RemoveLastIpCharacter();
-        handled = true;
-    } else {
-        char character = 0;
-        if (TryGetIpCharacter(vk, key, character)) {
-            AppendIpCharacter(character);
-            handled = true;
-        } else {
-            // SceneID 2 is an overlay-only input mode; suppress other ordinary
-            // keys too, so they cannot activate vanilla menu items.
-            handled = true;
-        }
+    if (code >= 0 && data != 0 &&
+        (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        g_inputEnabled && g_sceneId == 2) {
+        const auto& key = *reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
+        g_inputHookEvents.fetch_add(1);
+        g_inputLastVirtualKey.store(key.vkCode);
     }
 
-    if (handled) {
-        if (vk < _countof(g_suppressedKeys))
-            g_suppressedKeys[vk] = true;
-        // Keep the text actually used by PaintInputLayer in sync with the buffer.
-        // Previously the buffer changed and a redraw was requested, but g_inputLine
-        // was only rebuilt on scene transitions; that made typed characters invisible.
-        UpdateInputText();
-        RequestInputRedraw();
-        return 1;
-    }
+    // Do not consume keyboard input here. In fullscreen/direct-input-like game
+    // modes the low-level hook may not receive useful key states, while
+    // GetAsyncKeyState is already used successfully by the in-game F10 hook.
+    // IP input is therefore polled from BattleManager::onProcess below.
     return CallNextHookEx(g_keyboardHook, code, message, data);
 }
 
@@ -1179,17 +1127,20 @@ void PaintInputLayer(HWND window)
     const bool focused = IsGameForeground();
     const unsigned long long events = g_inputHookEvents.load();
     const DWORD lastVk = g_inputLastVirtualKey.load();
+    const unsigned long long pollEvents = g_inputPollEvents.load();
+    const DWORD lastPolledVk = g_inputLastPolledVirtualKey.load();
     const int clipStatus = g_clipboardStatus.load();
     const int pasteStatus = g_pasteStatus.load();
     const DWORD clipError = g_clipboardError.load();
 
     wchar_t diag1[128]{};
-    wchar_t diag2[160]{};
+    wchar_t diag2[192]{};
     wchar_t diag3[128]{};
     swprintf_s(diag1, _countof(diag1), L"Hook:%s  Scene:%d  Focus:%c",
         hookInstalled ? L"ON" : L"OFF", scene, focused ? L'Y' : L'N');
-    swprintf_s(diag2, _countof(diag2), L"Events:%llu  Key:0x%02X  Len:%zu",
-        events, static_cast<unsigned int>(lastVk), inputLength);
+    swprintf_s(diag2, _countof(diag2), L"Hook:%llu Key:0x%02X  Poll:%llu PKey:0x%02X Len:%zu",
+        events, static_cast<unsigned int>(lastVk), pollEvents,
+        static_cast<unsigned int>(lastPolledVk), inputLength);
     const wchar_t* clipText = clipStatus < 0 ? L"--" : clipStatus == 0 ? L"EMPTY" : clipStatus == 1 ? L"OK" : L"FAIL";
     const wchar_t* pasteText = pasteStatus < 0 ? L"--" : pasteStatus == 1 ? L"OK" : L"FAIL";
     if (clipStatus == 2)
@@ -1322,8 +1273,68 @@ LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM
     }
 }
 
+void PollIpInputFromGameFrame()
+{
+    // Poll both top-row and numpad keys once per game frame. Edge detection
+    // avoids repeated characters when a key is held down.
+    static const DWORD keysToPoll[] = {
+        '0','1','2','3','4','5','6','7','8','9',
+        VK_NUMPAD0,VK_NUMPAD1,VK_NUMPAD2,VK_NUMPAD3,VK_NUMPAD4,
+        VK_NUMPAD5,VK_NUMPAD6,VK_NUMPAD7,VK_NUMPAD8,VK_NUMPAD9,
+        VK_DECIMAL, VK_OEM_PERIOD, VK_OEM_1, VK_OEM_PLUS,
+        VK_BACK, VK_RETURN, 'V'
+    };
+
+    const bool inputMode = g_inputEnabled.load() && g_sceneId.load() == 2;
+    for (DWORD vk : keysToPoll) {
+        const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+        const bool pressed = down && !g_previousPolledKeyDown[vk];
+        g_previousPolledKeyDown[vk] = down;
+        if (!pressed || !inputMode)
+            continue;
+
+        g_inputPollEvents.fetch_add(1);
+        g_inputLastPolledVirtualKey.store(vk);
+
+        // Alt+Enter must be left entirely to the game for fullscreen switching.
+        if (vk == VK_RETURN && IsAltDown())
+            continue;
+
+        bool handled = false;
+        if (vk == VK_RETURN) {
+            CopyInputToClipboardAndClear();
+            handled = true;
+        } else if (vk == 'V' && IsControlDown()) {
+            g_pasteStatus.store(PasteClipboardIp() ? 1 : 2);
+            handled = true;
+        } else if (IsControlDown()) {
+            // Do not interpret modified shortcuts as IP characters.
+            continue;
+        } else if (vk == VK_BACK) {
+            RemoveLastIpCharacter();
+            handled = true;
+        } else {
+            KBDLLHOOKSTRUCT key{};
+            key.vkCode = vk;
+            key.scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+            char character = 0;
+            if (TryGetIpCharacter(vk, key, character)) {
+                AppendIpCharacter(character);
+                handled = true;
+            }
+        }
+
+        if (handled) {
+            UpdateInputText();
+            RequestInputRedraw();
+        }
+    }
+}
+
 int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
 {
+    PollIpInputFromGameFrame();
+
     // Poll F10 on the game frame as well, so the key is not missed while the
     // overlay thread is sleeping between its 35ms window-placement checks.
     const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
@@ -1407,9 +1418,7 @@ DWORD WINAPI OverlayThread(void*)
     }
 
     // Per-pixel transparency is applied by UpdateLayeredWindow, not SetLayeredWindowAttributes.
-    // IP input is handled directly in the low-level keyboard hook. Do not poll
-    // GetAsyncKeyState for keys that this hook consumes, because their async state
-    // may never reflect a press that was suppressed before reaching the game.
+    // The low-level hook is diagnostic only; input is polled from the game's frame hook.
     InstallKeyboardHook();
     g_lastKeyboardHookCheck = Clock::now();
     g_databasePath = FindDefaultDatabase();
