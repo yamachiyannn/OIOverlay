@@ -642,6 +642,10 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
     if (handled) {
         if (vk < _countof(g_suppressedKeys))
             g_suppressedKeys[vk] = true;
+        // Keep the text actually used by PaintInputLayer in sync with the buffer.
+        // Previously the buffer changed and a redraw was requested, but g_inputLine
+        // was only rebuilt on scene transitions; that made typed characters invisible.
+        UpdateInputText();
         RequestInputRedraw();
         return 1;
     }
