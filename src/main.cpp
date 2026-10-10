@@ -454,13 +454,6 @@ bool IsControlDown()
            (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
 }
 
-bool KeyPressed(int vk)
-{
-    // Follow the known-working 5a8b46b implementation: use the transition bit
-    // from GetAsyncKeyState once from BattleManager::onProcess.
-    return (GetAsyncKeyState(vk) & 1) != 0;
-}
-
 std::string GetInputBufferSnapshot()
 {
     std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -595,52 +588,6 @@ bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
     return false;
 }
 
-void PollMenuInput(int scene)
-{
-    if (scene != 2 || !IsGameForeground())
-        return;
-
-    // Alt+Enter is owned by the vanilla game. Do not consume it or copy text.
-    if (IsAltDown())
-        return;
-
-    bool changed = false;
-    if (!IsControlDown() && KeyPressed(VK_BACK)) {
-        RemoveLastIpCharacter();
-        changed = true;
-    }
-
-    if (IsControlDown() && KeyPressed('V')) {
-        changed = PasteClipboardIp() || changed;
-    } else if (KeyPressed(VK_RETURN)) {
-        CopyInputToClipboardAndClear();
-        changed = true;
-    } else if (!IsControlDown()) {
-        // Number row, numpad, decimal key, and JIS/Windows-layout punctuation.
-        const int keys[] = {
-            '0','1','2','3','4','5','6','7','8','9',
-            VK_NUMPAD0,VK_NUMPAD1,VK_NUMPAD2,VK_NUMPAD3,VK_NUMPAD4,
-            VK_NUMPAD5,VK_NUMPAD6,VK_NUMPAD7,VK_NUMPAD8,VK_NUMPAD9,
-            VK_DECIMAL,VK_OEM_PERIOD,VK_OEM_1,VK_OEM_PLUS
-        };
-        for (int vk : keys) {
-            if (!KeyPressed(vk))
-                continue;
-            KBDLLHOOKSTRUCT key{};
-            key.vkCode = static_cast<DWORD>(vk);
-            key.scanCode = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
-            char character = 0;
-            if (TryGetIpCharacter(static_cast<DWORD>(vk), key, character)) {
-                AppendIpCharacter(character);
-                changed = true;
-            }
-        }
-    }
-
-    if (changed)
-        RequestInputRedraw();
-}
-
 LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
 {
     if (code < 0 || data == 0)
@@ -651,6 +598,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
     const bool isDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
     const bool isUp = message == WM_KEYUP || message == WM_SYSKEYUP;
 
+    // Consume key-up only when its corresponding key-down was consumed here.
     if (isUp && vk < _countof(g_suppressedKeys) && g_suppressedKeys[vk]) {
         g_suppressedKeys[vk] = false;
         return 1;
@@ -658,20 +606,43 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
     if (!isDown || !g_inputEnabled || g_sceneId != 2 || !IsGameForeground())
         return CallNextHookEx(g_keyboardHook, code, message, data);
 
-    // Alt+Enter must pass to the game so the built-in fullscreen toggle works.
-    if (vk == VK_RETURN && IsAltPressed(key))
-        return CallNextHookEx(g_keyboardHook, code, message, data);
-
-    // Keep modifier state visible to GetAsyncKeyState and the keyboard layout.
-    if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+    // Alt+Enter belongs to the game. Modifier keys must pass so Windows can
+    // maintain modifier state, and F10 remains available to the overlay hotkey.
+    if ((vk == VK_RETURN && IsAltPressed(key)) || vk == VK_F10 ||
+        vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
         vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
         vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU)
         return CallNextHookEx(g_keyboardHook, code, message, data);
 
-    // Input is polled from BattleManager::onProcess; this hook only keeps typed
-    // keys from activating the vanilla menu while SceneID 2 is active.
-    if (vk < _countof(g_suppressedKeys)) {
-        g_suppressedKeys[vk] = true;
+    bool handled = false;
+    if (vk == VK_RETURN) {
+        CopyInputToClipboardAndClear();
+        handled = true;
+    } else if (IsControlDown() && vk == 'V') {
+        PasteClipboardIp();
+        handled = true;
+    } else if (IsControlDown()) {
+        // Do not leak other Ctrl shortcuts into the game's menu while entering an IP.
+        handled = true;
+    } else if (vk == VK_BACK) {
+        RemoveLastIpCharacter();
+        handled = true;
+    } else {
+        char character = 0;
+        if (TryGetIpCharacter(vk, key, character)) {
+            AppendIpCharacter(character);
+            handled = true;
+        } else {
+            // SceneID 2 is an overlay-only input mode; suppress other ordinary
+            // keys too, so they cannot activate vanilla menu items.
+            handled = true;
+        }
+    }
+
+    if (handled) {
+        if (vk < _countof(g_suppressedKeys))
+            g_suppressedKeys[vk] = true;
+        RequestInputRedraw();
         return 1;
     }
     return CallNextHookEx(g_keyboardHook, code, message, data);
@@ -1270,10 +1241,6 @@ int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
     }
     g_previousProcessF10Down = f10Down;
 
-    int scene = -1;
-    if (TryReadSceneId(scene))
-        PollMenuInput(scene);
-
     if (g_originalBattleManagerOnProcess)
         return (self->*g_originalBattleManagerOnProcess)();
     return 0;
@@ -1348,8 +1315,9 @@ DWORD WINAPI OverlayThread(void*)
     }
 
     // Per-pixel transparency is applied by UpdateLayeredWindow, not SetLayeredWindowAttributes.
-    // The low-level hook suppresses ordinary menu keys in SceneID 2. Actual IP text
-    // input is polled by BattleManager::onProcess using GetAsyncKeyState; Alt+Enter passes through.
+    // IP input is handled directly in the low-level keyboard hook. Do not poll
+    // GetAsyncKeyState for keys that this hook consumes, because their async state
+    // may never reflect a press that was suppressed before reaching the game.
     InstallKeyboardHook();
     g_lastKeyboardHookCheck = Clock::now();
     g_databasePath = FindDefaultDatabase();
