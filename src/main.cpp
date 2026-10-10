@@ -48,7 +48,8 @@ volatile LONG g_stopRequested = 0;
 std::atomic<int> g_sceneId{-1};
 bool g_clientMode = false;
 std::atomic<bool> g_overlayEnabled{true};
-bool g_previousProcessF10Down = false;
+bool g_previousAsyncF10Down = false;
+bool g_overlayManuallyDisabledForSession = false;
 bool g_tskRunning = false;
 enum class TskWarningState { None, NotRunning, GameNotDetected };
 TskWarningState g_tskWarningState = TskWarningState::None;
@@ -784,6 +785,18 @@ bool UpdateSceneState()
 
     const int oldScene = g_sceneId;
     g_sceneId = scene;
+
+    // A new character-select / spectator-loading session starts enabled by default.
+    // Once F10 disables the overlay, keep it disabled until the game returns to SceneID <= 7.
+    if (scene <= 7) {
+        g_overlayManuallyDisabledForSession = false;
+    } else if ((scene == 8 || scene == 9 || scene == 12) && oldScene <= 7) {
+        if (!g_overlayManuallyDisabledForSession) {
+            g_overlayEnabled.store(true);
+            RequestInfoRedraw();
+        }
+    }
+
     if (scene <= 7) {
         g_clientMode = false;
         g_opponentProfile.clear();
@@ -1335,18 +1348,8 @@ void PollIpInputFromGameFrame()
 
 int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
 {
-    // F10 remains polled here for low-latency game-frame edge detection.
-    // IP input is polled by the overlay thread and does not depend on this hook.
-
-    // Poll F10 on the game frame as well, so the key is not missed while the
-    // overlay thread is sleeping between its 35ms window-placement checks.
-    const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (f10Down && !g_previousProcessF10Down) {
-        g_overlayEnabled.store(!g_overlayEnabled.load());
-        RequestInfoRedraw();
-    }
-    g_previousProcessF10Down = f10Down;
-
+    // F10 is polled asynchronously by the overlay thread so it also works while
+    // loading spectator matches, before BattleManager::onProcess is running.
     if (g_originalBattleManagerOnProcess)
         return (self->*g_originalBattleManagerOnProcess)();
     return 0;
@@ -1445,6 +1448,18 @@ DWORD WINAPI OverlayThread(void*)
             DispatchMessageW(&message);
         }
         const auto now = Clock::now();
+
+        // Async F10 polling: do not depend on BattleManager::onProcess, which may
+        // not run during character-select or spectator loading. Ignore SceneID <= 7.
+        const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        if (g_sceneId.load() > 7 && IsGameForeground() && f10Down && !g_previousAsyncF10Down) {
+            const bool enable = !g_overlayEnabled.load();
+            g_overlayEnabled.store(enable);
+            if (!enable)
+                g_overlayManuallyDisabledForSession = true;
+            RequestInfoRedraw();
+        }
+        g_previousAsyncF10Down = f10Down;
 
         if (now - g_lastWindowSearch >= std::chrono::milliseconds(35) || !g_gameWindow) {
             HWND found = FindGameWindow();
