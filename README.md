@@ -22,5 +22,13 @@ th123OIViewerの機能を一部移植してSWRSToysのモジュールにした�
 
 
 
-20261010
+# クレジット
+
+
+
+https://github.com/SokuDev/ModTemplate
+
+
+
+更新: 20261010
 
