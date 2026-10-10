@@ -65,6 +65,15 @@ std::string g_cachedWatchingP2;
 std::string g_inputBuffer;
 std::vector<std::wstring> g_infoLines;
 std::wstring g_inputLine;
+
+// Visible keyboard/clipboard diagnostics. Status values: -1 = not attempted,
+// 0 = empty input, 1 = success, 2 = failure. Atomics are shared by the
+// low-level keyboard callback and the overlay window thread.
+std::atomic<unsigned long long> g_inputHookEvents{0};
+std::atomic<DWORD> g_inputLastVirtualKey{0};
+std::atomic<int> g_clipboardStatus{-1};
+std::atomic<int> g_pasteStatus{-1};
+std::atomic<DWORD> g_clipboardError{ERROR_SUCCESS};
 std::unique_ptr<TskDatabase> g_database;
 std::wstring g_databasePath;
 TskStats g_normalStats;
@@ -401,33 +410,60 @@ void SplitLines(const std::wstring& text, std::vector<std::wstring>& out)
     }
 }
 
-void SetClipboardText(const std::string& text)
+bool SetClipboardText(const std::string& text)
 {
-    if (text.empty())
-        return;
+    if (text.empty()) {
+        g_clipboardError.store(ERROR_SUCCESS);
+        return false;
+    }
     const int chars = MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, nullptr, 0);
-    if (chars <= 0)
-        return;
+    if (chars <= 0) {
+        g_clipboardError.store(ERROR_NO_UNICODE_TRANSLATION);
+        return false;
+    }
     std::wstring wide(static_cast<size_t>(chars), L'\0');
-    MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, &wide[0], chars);
+    if (MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, &wide[0], chars) <= 0) {
+        g_clipboardError.store(ERROR_NO_UNICODE_TRANSLATION);
+        return false;
+    }
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, wide.size() * sizeof(wchar_t));
-    if (!memory)
-        return;
+    if (!memory) {
+        g_clipboardError.store(GetLastError());
+        return false;
+    }
     void* target = GlobalLock(memory);
     if (!target) {
+        const DWORD error = GetLastError();
         GlobalFree(memory);
-        return;
+        g_clipboardError.store(error);
+        return false;
     }
     std::memcpy(target, wide.c_str(), wide.size() * sizeof(wchar_t));
     GlobalUnlock(memory);
     if (!OpenClipboard(nullptr)) {
+        const DWORD error = GetLastError();
         GlobalFree(memory);
-        return;
+        g_clipboardError.store(error);
+        return false;
     }
-    EmptyClipboard();
-    if (!SetClipboardData(CF_UNICODETEXT, memory))
+    if (!EmptyClipboard()) {
+        const DWORD error = GetLastError();
+        CloseClipboard();
         GlobalFree(memory);
+        g_clipboardError.store(error);
+        return false;
+    }
+    if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+        const DWORD error = GetLastError();
+        CloseClipboard();
+        GlobalFree(memory);
+        g_clipboardError.store(error);
+        return false;
+    }
+    // Ownership of memory transfers to the system after successful SetClipboardData.
     CloseClipboard();
+    g_clipboardError.store(ERROR_SUCCESS);
+    return true;
 }
 
 bool IsGameForeground()
@@ -483,12 +519,20 @@ void RemoveLastIpCharacter()
 
 void CopyInputToClipboardAndClear()
 {
-    std::string value;
-    {
-        std::lock_guard<std::mutex> lock(g_inputMutex);
-        value.swap(g_inputBuffer);
+    const std::string value = GetInputBufferSnapshot();
+    if (value.empty()) {
+        g_clipboardStatus.store(0);
+        ClearInputBuffer();
+        return;
     }
-    SetClipboardText(value);
+
+    if (SetClipboardText(value)) {
+        g_clipboardStatus.store(1);
+        ClearInputBuffer();
+    } else {
+        // Preserve the text so the user can retry if Windows denies clipboard access.
+        g_clipboardStatus.store(2);
+    }
 }
 
 bool PasteClipboardIp()
@@ -603,7 +647,14 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
         g_suppressedKeys[vk] = false;
         return 1;
     }
-    if (!isDown || !g_inputEnabled || g_sceneId != 2 || !IsGameForeground())
+    if (!isDown || !g_inputEnabled || g_sceneId != 2)
+        return CallNextHookEx(g_keyboardHook, code, message, data);
+
+    // Count keys reaching the hook before the foreground gate, so the diagnostic
+    // distinguishes a dead hook from an incorrect focus condition.
+    g_inputHookEvents.fetch_add(1);
+    g_inputLastVirtualKey.store(vk);
+    if (!IsGameForeground())
         return CallNextHookEx(g_keyboardHook, code, message, data);
 
     // Alt+Enter belongs to the game. Modifier keys must pass so Windows can
@@ -619,7 +670,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
         CopyInputToClipboardAndClear();
         handled = true;
     } else if (IsControlDown() && vk == 'V') {
-        PasteClipboardIp();
+        g_pasteStatus.store(PasteClipboardIp() ? 1 : 2);
         handled = true;
     } else if (IsControlDown()) {
         // Do not leak other Ctrl shortcuts into the game's menu while entering an IP.
@@ -880,6 +931,7 @@ void UpdateInputText()
     std::wstring next;
     if (g_inputEnabled && g_sceneId == 2)
         next = L"IP:Port ＞ " + NarrowAsciiToWide(GetInputBufferSnapshot()) + L"_";
+    std::lock_guard<std::mutex> lock(g_inputMutex);
     if (next != g_inputLine)
         g_inputLine = std::move(next);
 }
@@ -1114,33 +1166,69 @@ void PaintInputLayer(HWND window)
         return;
     }
 
+    std::wstring inputLine;
+    size_t inputLength = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        inputLine = g_inputLine;
+        inputLength = g_inputBuffer.size();
+    }
+
+    const bool hookInstalled = g_keyboardHook != nullptr;
+    const int scene = g_sceneId.load();
+    const bool focused = IsGameForeground();
+    const unsigned long long events = g_inputHookEvents.load();
+    const DWORD lastVk = g_inputLastVirtualKey.load();
+    const int clipStatus = g_clipboardStatus.load();
+    const int pasteStatus = g_pasteStatus.load();
+    const DWORD clipError = g_clipboardError.load();
+
+    wchar_t diag1[128]{};
+    wchar_t diag2[160]{};
+    wchar_t diag3[128]{};
+    swprintf_s(diag1, _countof(diag1), L"Hook:%s  Scene:%d  Focus:%c",
+        hookInstalled ? L"ON" : L"OFF", scene, focused ? L'Y' : L'N');
+    swprintf_s(diag2, _countof(diag2), L"Events:%llu  Key:0x%02X  Len:%zu",
+        events, static_cast<unsigned int>(lastVk), inputLength);
+    const wchar_t* clipText = clipStatus < 0 ? L"--" : clipStatus == 0 ? L"EMPTY" : clipStatus == 1 ? L"OK" : L"FAIL";
+    const wchar_t* pasteText = pasteStatus < 0 ? L"--" : pasteStatus == 1 ? L"OK" : L"FAIL";
+    if (clipStatus == 2)
+        swprintf_s(diag3, _countof(diag3), L"Clip:%s (err %lu)  Paste:%s", clipText, clipError, pasteText);
+    else
+        swprintf_s(diag3, _countof(diag3), L"Clip:%s  Paste:%s", clipText, pasteText);
+
     const COLORREF background = RGB(10, 10, 10);
-    const std::wstring help = g_keyboardHook
-        ? L"数字・.・: / Backspace / Ctrl+V / Enterでコピー"
-        : L"キー入力の抑止を初期化中（入力処理は継続）";
+    const std::wstring help = L"数字・.・: / Backspace / Ctrl+V / Enterでコピー";
     HDC measureDc = GetDC(nullptr);
     if (!measureDc) return;
-    HFONT font = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+    HFONT font = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
     HGDIOBJ oldFont = SelectObject(measureDc, font);
-    const int maxPanelWidth = (std::max)(120, (std::min)(gameWidth - 24, 480));
-    const int panelWidth = (std::min)(maxPanelWidth, (std::max)(160,
-        (std::max)(TextPixelWidth(measureDc, g_inputLine), TextPixelWidth(measureDc, help)) + 18));
+    const int maxPanelWidth = (std::max)(120, (std::min)(gameWidth - 24, 520));
+    int requestedWidth = TextPixelWidth(measureDc, inputLine);
+    requestedWidth = (std::max)(requestedWidth, TextPixelWidth(measureDc, help));
+    requestedWidth = (std::max)(requestedWidth, TextPixelWidth(measureDc, diag1));
+    requestedWidth = (std::max)(requestedWidth, TextPixelWidth(measureDc, diag2));
+    requestedWidth = (std::max)(requestedWidth, TextPixelWidth(measureDc, diag3));
+    const int panelWidth = (std::min)(maxPanelWidth, (std::max)(230, requestedWidth + 18));
     SelectObject(measureDc, oldFont);
     DeleteObject(font);
     ReleaseDC(nullptr, measureDc);
 
-    const int panelHeight = 44;
+    const int panelHeight = 83;
     const int left = 12;
     const int top = (std::max)(8, gameHeight - panelHeight - 14);
     RenderLayerSurface(window, g_lastGameClientRect.left + left, g_lastGameClientRect.top + top,
         panelWidth, panelHeight, [=](HDC dc, std::vector<AlphaFill>& fills) {
-            HFONT drawFont = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+            HFONT drawFont = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
             RECT panel{ 0, 0, panelWidth, panelHeight };
-            DrawAndRegisterPanel(dc, panel, background, 180, RGB(90, 145, 110), fills);
-            DrawTextLine(dc, g_inputLine, 8, 3, panelWidth - 16, 20, RGB(255, 255, 255), drawFont);
-            DrawTextLine(dc, help, 8, 23, panelWidth - 16, 17, RGB(190, 220, 200), drawFont);
+            DrawAndRegisterPanel(dc, panel, background, 190, RGB(90, 145, 110), fills);
+            DrawTextLine(dc, inputLine, 8, 2, panelWidth - 16, 18, RGB(255, 255, 255), drawFont);
+            DrawTextLine(dc, help, 8, 20, panelWidth - 16, 15, RGB(190, 220, 200), drawFont);
+            DrawTextLine(dc, diag1, 8, 37, panelWidth - 16, 14, RGB(255, 230, 150), drawFont);
+            DrawTextLine(dc, diag2, 8, 51, panelWidth - 16, 14, RGB(220, 230, 255), drawFont);
+            DrawTextLine(dc, diag3, 8, 65, panelWidth - 16, 14, RGB(255, 205, 175), drawFont);
             DeleteObject(drawFont);
         });
 }
