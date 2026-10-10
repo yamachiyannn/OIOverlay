@@ -644,10 +644,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
         g_inputLastVirtualKey.store(key.vkCode);
     }
 
-    // Do not consume keyboard input here. In fullscreen/direct-input-like game
-    // modes the low-level hook may not receive useful key states, while
-    // GetAsyncKeyState is already used successfully by the in-game F10 hook.
-    // IP input is therefore polled from BattleManager::onProcess below.
+    // Diagnostic only. Actual IP input polling runs on the overlay thread,
+    // so it also works on the title/menu screen before BattleManager is active.
     return CallNextHookEx(g_keyboardHook, code, message, data);
 }
 
@@ -1285,7 +1283,7 @@ void PollIpInputFromGameFrame()
         VK_BACK, VK_RETURN, 'V'
     };
 
-    const bool inputMode = g_inputEnabled.load() && g_sceneId.load() == 2;
+    const bool inputMode = g_inputEnabled.load() && g_sceneId.load() == 2 && IsGameForeground();
     for (DWORD vk : keysToPoll) {
         const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
         const bool pressed = down && !g_previousPolledKeyDown[vk];
@@ -1333,7 +1331,8 @@ void PollIpInputFromGameFrame()
 
 int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
 {
-    PollIpInputFromGameFrame();
+    // F10 remains polled here for low-latency game-frame edge detection.
+    // IP input is polled by the overlay thread and does not depend on this hook.
 
     // Poll F10 on the game frame as well, so the key is not missed while the
     // overlay thread is sleeping between its 35ms window-placement checks.
@@ -1532,6 +1531,10 @@ DWORD WINAPI OverlayThread(void*)
             g_lastCharacterRefresh = now;
         }
 
+        // Poll IP input independently of BattleManager::onProcess so it works
+        // on SceneID 2 even when the game is at the title/menu screen.
+        PollIpInputFromGameFrame();
+
         // Only the information layer refreshes once per second in character-select.
         // Spectator records are re-read only on SceneID transitions.
         if (g_sceneId >= 8 && g_sceneId <= 11 &&
@@ -1562,7 +1565,7 @@ DWORD WINAPI OverlayThread(void*)
             g_lastWarningBlink = now;
             RequestWarningRedraw();
         }
-        Sleep(35);
+        Sleep(8);
     }
 
     if (g_keyboardHook) {
