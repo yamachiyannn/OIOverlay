@@ -149,6 +149,12 @@ add_library(
     src/main.cpp
     src/TskDatabase.cpp
     src/TskDatabase.hpp
+    src/OverlayConfig.cpp
+    src/OverlayConfig.hpp
+    src/CombinedPlayersDatabase.cpp
+    src/CombinedPlayersDatabase.hpp
+    src/IpPortParser.cpp
+    src/IpPortParser.hpp
     src/version.rc
 )
 
@@ -220,5 +226,12 @@ install(
 install(
     FILES
     LICENSE
+    DESTINATION .
+)
+
+# Ship the user-editable config file beside OIOverlay.dll.
+install(
+    FILES
+    OIOverlay.ini
     DESTINATION .
 )

@@ -538,12 +538,22 @@ bool TskDatabase::GetOpponentStats(
     TskStats& stats
 ) const
 {
-    stats = {};
-    stats.profileNameCp932 =
-        profileCp932;
-
-    if (profileCp932.empty())
+    if (profileCp932.empty()) {
+        stats = {};
         return false;
+    }
+    return GetOpponentStats(std::vector<std::string>{profileCp932}, stats);
+}
+
+bool TskDatabase::GetOpponentStats(
+    const std::vector<std::string>& profilesCp932,
+    TskStats& stats
+) const
+{
+    stats = {};
+    if (profilesCp932.empty())
+        return false;
+    stats.profileNameCp932 = profilesCp932.front();
 
     if (!IsAvailable())
         return false;
@@ -616,13 +626,15 @@ bool TskDatabase::GetOpponentStats(
          * OIViewerと同じく、
          * P2プロファイルとして検索する。
          */
-        if (!EqualCp932Blob(
-                stmt,
-                4,
-                profileCp932
-            )) {
-            continue;
+        bool profileMatched = false;
+        for (const auto& candidateProfile : profilesCp932) {
+            if (!candidateProfile.empty() && EqualCp932Blob(stmt, 4, candidateProfile)) {
+                profileMatched = true;
+                break;
+            }
         }
+        if (!profileMatched)
+            continue;
 
         records.push_back(
             ReadRecord(stmt)

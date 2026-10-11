@@ -74,6 +74,13 @@ public:
         TskStats& stats
     ) const;
 
+    // Combine records for all profiles assigned to the same player.
+    // The database is still opened read-only by the implementation.
+    bool GetOpponentStats(
+        const std::vector<std::string>& profilesCp932,
+        TskStats& stats
+    ) const;
+
 private:
     std::wstring dbPath;
 };

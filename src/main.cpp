@@ -9,10 +9,10 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 #include <SokuLib.hpp>
+#include <sqlite3.h>
 #include "TskDatabase.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cwchar>
 #include <cwctype>
 #include <chrono>
@@ -23,7 +23,6 @@
 #include <iomanip>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -45,18 +44,21 @@ HWND g_gameWindow = nullptr;
 enum class OverlayLayer : LONG_PTR { Info = 1, Input = 2, Warning = 3 };
 HHOOK g_keyboardHook = nullptr;
 volatile LONG g_stopRequested = 0;
-std::atomic<int> g_sceneId{-1};
+int g_sceneId = -1;
 bool g_clientMode = false;
-std::atomic<bool> g_overlayEnabled{true};
-bool g_previousAsyncF10Down = false;
+bool g_overlayEnabled = true;
+bool g_previousToggleKeyDown = false;
 bool g_overlayManuallyDisabledForSession = false;
+UINT g_toggleKey = VK_F10;
+bool g_defaultOverlayVisible = true;
+std::wstring g_configuredTskDatabasePath;
+std::wstring g_playersDatabasePath;
 bool g_tskRunning = false;
 enum class TskWarningState { None, NotRunning, GameNotDetected };
 TskWarningState g_tskWarningState = TskWarningState::None;
 bool g_warningBlink = false;
-std::atomic<bool> g_inputEnabled{false};
-bool g_previousPolledKeyDown[256]{};
-std::mutex g_inputMutex;
+bool g_inputEnabled = false;
+bool g_suppressedKeys[256]{};
 std::string g_opponentProfile;
 std::string g_watchingP1Profile;
 std::string g_watchingP2Profile;
@@ -66,19 +68,6 @@ std::string g_cachedWatchingP2;
 std::string g_inputBuffer;
 std::vector<std::wstring> g_infoLines;
 std::wstring g_inputLine;
-bool g_copiedFeedback = false;
-std::chrono::steady_clock::time_point g_copiedFeedbackUntil{};
-
-// Visible keyboard/clipboard diagnostics. Status values: -1 = not attempted,
-// 0 = empty input, 1 = success, 2 = failure. Atomics are shared by the
-// low-level keyboard callback and the overlay window thread.
-std::atomic<unsigned long long> g_inputHookEvents{0};
-std::atomic<DWORD> g_inputLastVirtualKey{0};
-std::atomic<unsigned long long> g_inputPollEvents{0};
-std::atomic<DWORD> g_inputLastPolledVirtualKey{0};
-std::atomic<int> g_clipboardStatus{-1};
-std::atomic<int> g_pasteStatus{-1};
-std::atomic<DWORD> g_clipboardError{ERROR_SUCCESS};
 std::unique_ptr<TskDatabase> g_database;
 std::wstring g_databasePath;
 TskStats g_normalStats;
@@ -90,15 +79,8 @@ bool g_watchP2StatsValid = false;
 std::uintmax_t g_dbSize = 0;
 FILETIME g_dbWriteTime{};
 RECT g_lastGameClientRect{};
-RECT g_lastGameWindowRect{};
-LONG_PTR g_lastGameWindowStyle = 0;
-LONG_PTR g_lastGameWindowExStyle = 0;
 HWND g_lastLocatedGameWindow = nullptr;
 bool g_haveLastGameClientRect = false;
-struct LayerBounds { int offsetX = 0; int offsetY = 0; int width = 0; int height = 0; bool valid = false; };
-LayerBounds g_infoLayerBounds;
-LayerBounds g_inputLayerBounds;
-LayerBounds g_warningLayerBounds;
 bool g_overlayWasVisible = false;
 
 using Clock = std::chrono::steady_clock;
@@ -110,8 +92,6 @@ Clock::time_point g_lastCharacterRefresh{};
 Clock::time_point g_lastWindowSearch{};
 Clock::time_point g_lastGeometryCheck{};
 Clock::time_point g_lastKeyboardHookCheck{};
-
-static int (SokuLib::BattleManager::*g_originalBattleManagerOnProcess)() = nullptr;
 
 void RequestWindowRedraw(HWND window);
 void RequestInfoRedraw();
@@ -159,6 +139,54 @@ std::wstring FindDefaultDatabase()
     return {};
 }
 
+
+std::wstring OverlayIniPath()
+{
+    wchar_t modulePath[32768]{};
+    const DWORD length = GetModuleFileNameW(g_module, modulePath, static_cast<DWORD>(_countof(modulePath)));
+    if (length == 0 || length >= _countof(modulePath))
+        return L"OIOverlay.ini";
+    std::wstring path(modulePath, length);
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return L"OIOverlay.ini";
+    return path.substr(0, slash + 1) + L"OIOverlay.ini";
+}
+
+void LoadOverlaySettings()
+{
+    const std::wstring iniPath = OverlayIniPath();
+    std::wstring defaultTskPath = FindDefaultDatabase();
+    if (defaultTskPath.empty())
+        defaultTskPath = L"C:\\Program Files (x86)\\tasofro\\th123\\th4_5888\\Default.db";
+
+    wchar_t value[32768]{};
+    GetPrivateProfileStringW(L"Paths", L"TskDb", defaultTskPath.c_str(), value,
+        static_cast<DWORD>(_countof(value)), iniPath.c_str());
+    g_configuredTskDatabasePath.assign(value);
+
+    const wchar_t* defaultPlayersPath =
+        L"C:\\Program Files (x86)\\tasofro\\th123\\th4_5888\\tsk_OIViewer\\CombinedPlayers.db";
+    GetPrivateProfileStringW(L"Paths", L"PlayersDb", defaultPlayersPath, value,
+        static_cast<DWORD>(_countof(value)), iniPath.c_str());
+    g_playersDatabasePath.assign(value);
+
+    GetPrivateProfileStringW(L"Overlay", L"DefaultVisible", L"1", value,
+        static_cast<DWORD>(_countof(value)), iniPath.c_str());
+    wchar_t* end = nullptr;
+    const long visible = std::wcstol(value, &end, 10);
+    g_defaultOverlayVisible = (end == value || *end != L'\0') ? true : visible != 0;
+
+    GetPrivateProfileStringW(L"Overlay", L"ToggleKey", L"0x79", value,
+        static_cast<DWORD>(_countof(value)), iniPath.c_str());
+    end = nullptr;
+    const unsigned long key = std::wcstoul(value, &end, 0);
+    if (value[0] == L'\0' || end == value || *end != L'\0' || key > 0xFFUL)
+        g_toggleKey = VK_F10;
+    else
+        g_toggleKey = static_cast<UINT>(key); // 0 disables the toggle key.
+}
+
 bool ReadFileInfo(const std::wstring& path, std::uintmax_t& size, FILETIME& writeTime)
 {
     WIN32_FILE_ATTRIBUTE_DATA data{};
@@ -190,6 +218,37 @@ bool IsTskRunning()
     }
     CloseHandle(snapshot);
     return found;
+}
+
+// Check the same window signature that TenSokuKan uses to identify the game.
+bool IsTskDetectingGame()
+{
+    const size_t slash = g_configuredTskDatabasePath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return false;
+    const std::wstring settingsPath = g_configuredTskDatabasePath.substr(0, slash) + L"\\SWRSAddr.ini";
+
+    wchar_t windowClass[256]{};
+    wchar_t windowText[512]{};
+    GetPrivateProfileStringW(L"SWRSName", L"SWRS_WINDOW_CLASS", L"th123_110a",
+        windowClass, static_cast<DWORD>(_countof(windowClass)), settingsPath.c_str());
+    GetPrivateProfileStringW(L"SWRSName", L"SWRS_WINDOW_TEXT",
+        L"東方非想天則 ～ 超弩級ギニョルの謎を追え Ver1.10a",
+        windowText, static_cast<DWORD>(_countof(windowText)), settingsPath.c_str());
+
+    const HWND gameWindow = FindWindowW(windowClass, windowText);
+    if (!gameWindow)
+        return false;
+    DWORD processId = 0;
+    if (GetWindowThreadProcessId(gameWindow, &processId) == 0 || processId == 0)
+        return false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process)
+        return false;
+    DWORD exitCode = 0;
+    const bool running = GetExitCodeProcess(process, &exitCode) != FALSE && exitCode == STILL_ACTIVE;
+    CloseHandle(process);
+    return running;
 }
 
 // Read game-owned memory through the OS API rather than directly dereferencing a
@@ -246,6 +305,153 @@ std::wstring Cp932ToWide(const std::string& value)
     std::wstring result(static_cast<size_t>(count), L'\0');
     MultiByteToWideChar(932, 0, value.data(), static_cast<int>(value.size()), &result[0], count);
     return result;
+}
+
+std::string WideToUtf8String(const std::wstring& value)
+{
+    if (value.empty())
+        return {};
+    const int count = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (count <= 0)
+        return {};
+    std::string result(static_cast<size_t>(count), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), &result[0], count, nullptr, nullptr) <= 0)
+        return {};
+    return result;
+}
+
+std::string WideToCp932(const std::wstring& value)
+{
+    if (value.empty())
+        return {};
+    const int count = WideCharToMultiByte(932, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (count <= 0)
+        return {};
+    std::string result(static_cast<size_t>(count), '\0');
+    if (WideCharToMultiByte(932, 0, value.data(), static_cast<int>(value.size()), &result[0], count, nullptr, nullptr) <= 0)
+        return {};
+    return result;
+}
+
+std::wstring SqliteColumnWideText(sqlite3_stmt* statement, int column)
+{
+    const auto* characters = static_cast<const wchar_t*>(sqlite3_column_text16(statement, column));
+    const int bytes = sqlite3_column_bytes16(statement, column);
+    if (!characters || bytes <= 0 || bytes % static_cast<int>(sizeof(wchar_t)) != 0)
+        return {};
+    return std::wstring(characters, static_cast<size_t>(bytes) / sizeof(wchar_t));
+}
+
+bool IsBlankWide(const std::wstring& value)
+{
+    return std::all_of(value.begin(), value.end(), [](wchar_t ch) { return std::iswspace(ch) != 0; });
+}
+
+bool ResolveCombinedPlayer(
+    const std::string& profileCp932,
+    std::wstring& displayName,
+    std::vector<std::string>& profilesCp932)
+{
+    displayName.clear();
+    profilesCp932.clear();
+    if (g_playersDatabasePath.empty() || profileCp932.empty())
+        return false;
+    const std::wstring profileWide = Cp932ToWide(profileCp932);
+    const std::string pathUtf8 = WideToUtf8String(g_playersDatabasePath);
+    if (profileWide.empty() || pathUtf8.empty())
+        return false;
+
+    sqlite3* rawDatabase = nullptr;
+    if (sqlite3_open_v2(pathUtf8.c_str(), &rawDatabase,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr) != SQLITE_OK || !rawDatabase) {
+        if (rawDatabase)
+            sqlite3_close(rawDatabase);
+        return false;
+    }
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> database(rawDatabase, sqlite3_close);
+    sqlite3_busy_timeout(database.get(), 200);
+
+    int playerId = -1;
+    std::wstring playerName;
+    std::wstring representativeProfile;
+    {
+        constexpr char query[] =
+            "SELECT p.PlayerId, COALESCE(p.PlayerName, ''), COALESCE(p.RepresentativeProfile, '') "
+            "FROM Players AS p JOIN Profiles AS pr ON pr.PlayerId = p.PlayerId "
+            "WHERE pr.ProfileName = ?1 COLLATE BINARY LIMIT 1;";
+        sqlite3_stmt* rawStatement = nullptr;
+        if (sqlite3_prepare_v2(database.get(), query, -1, &rawStatement, nullptr) != SQLITE_OK || !rawStatement)
+            return false;
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(rawStatement, sqlite3_finalize);
+        if (sqlite3_bind_text16(statement.get(), 1, profileWide.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_step(statement.get()) != SQLITE_ROW)
+            return false;
+        playerId = sqlite3_column_int(statement.get(), 0);
+        playerName = SqliteColumnWideText(statement.get(), 1);
+        representativeProfile = SqliteColumnWideText(statement.get(), 2);
+    }
+    if (playerId < 0)
+        return false;
+
+    if (!representativeProfile.empty()) {
+        const std::string representative = WideToCp932(representativeProfile);
+        if (!representative.empty())
+            profilesCp932.push_back(representative);
+    }
+    {
+        constexpr char query[] =
+            "SELECT ProfileName FROM Profiles WHERE PlayerId = ?1 "
+            "ORDER BY DisplayOrder, ProfileName COLLATE BINARY;";
+        sqlite3_stmt* rawStatement = nullptr;
+        if (sqlite3_prepare_v2(database.get(), query, -1, &rawStatement, nullptr) != SQLITE_OK || !rawStatement) {
+            profilesCp932.clear();
+            return false;
+        }
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(rawStatement, sqlite3_finalize);
+        if (sqlite3_bind_int(statement.get(), 1, playerId) != SQLITE_OK) {
+            profilesCp932.clear();
+            return false;
+        }
+        int step = SQLITE_ROW;
+        while ((step = sqlite3_step(statement.get())) == SQLITE_ROW) {
+            const std::string name = WideToCp932(SqliteColumnWideText(statement.get(), 0));
+            if (!name.empty() && std::find(profilesCp932.begin(), profilesCp932.end(), name) == profilesCp932.end())
+                profilesCp932.push_back(name);
+        }
+        if (step != SQLITE_DONE) {
+            profilesCp932.clear();
+            return false;
+        }
+    }
+    if (profilesCp932.empty())
+        return false;
+    displayName = !IsBlankWide(playerName) ? playerName : representativeProfile;
+    if (displayName.empty())
+        displayName = profileWide;
+    return true;
+}
+
+std::vector<std::string> ProfilesForStats(const std::string& profileCp932)
+{
+    if (profileCp932.empty())
+        return {};
+    std::wstring ignoredDisplayName;
+    std::vector<std::string> profiles;
+    if (ResolveCombinedPlayer(profileCp932, ignoredDisplayName, profiles) && !profiles.empty())
+        return profiles;
+    // If the file/path/profile is unavailable, keep the existing per-profile lookup.
+    return { profileCp932 };
+}
+
+std::wstring ProfileDisplayName(const std::string& profileCp932)
+{
+    if (profileCp932.empty())
+        return {};
+    std::wstring displayName;
+    std::vector<std::string> profiles;
+    if (ResolveCombinedPlayer(profileCp932, displayName, profiles) && !displayName.empty())
+        return displayName;
+    return Cp932ToWide(profileCp932);
 }
 
 std::wstring NarrowAsciiToWide(const std::string& value)
@@ -324,7 +530,7 @@ std::wstring WatchRateLine(const wchar_t* label, const TskStats& p1, const TskSt
 
 std::wstring WatchingPlayerText(const wchar_t* side, const std::string& profile, const TskStats& stats, bool statsRead)
 {
-    std::wstring text = std::wstring(side) + L" : " + Cp932ToWide(profile) + L"\n";
+    std::wstring text = std::wstring(side) + L" : " + ProfileDisplayName(profile) + L"\n";
     if (!statsRead || !stats.found) {
         text += L"メインキャラ : ---\n通算 : 0戦";
         return text;
@@ -336,20 +542,12 @@ std::wstring WatchingPlayerText(const wchar_t* side, const std::string& profile,
     return text;
 }
 
-// OIV Form1's normal-match overlay is visible only during character select/loading.
-// Scenes 13-14 are deliberately excluded; spectator scenes are handled separately.
-bool IsNormalInfoScene(int scene)
-{
-    return scene >= 8 && scene <= 11;
-}
-
 std::wstring BuildNormalInfo()
 {
-    // Keep the visible text in sync with Form1.ShowOpponentInfo.
     if (g_opponentProfile.empty())
-        return L"【対戦中】\n\n対戦相手を取得中...";
+        return L"【キャラセレ中】\n\n対戦相手を取得中...";
 
-    std::wstring text = L"【対戦中】\n\n対戦相手 : " + Cp932ToWide(g_opponentProfile) + L"\n";
+    std::wstring text = L"【キャラセレ中】\n\n対戦相手 : " + ProfileDisplayName(g_opponentProfile) + L"\n";
     if (!g_normalStatsValid || !g_normalStats.found) {
         text += L"\n対戦記録がありません";
         return text;
@@ -423,60 +621,33 @@ void SplitLines(const std::wstring& text, std::vector<std::wstring>& out)
     }
 }
 
-bool SetClipboardText(const std::string& text)
+void SetClipboardText(const std::string& text)
 {
-    if (text.empty()) {
-        g_clipboardError.store(ERROR_SUCCESS);
-        return false;
-    }
+    if (text.empty())
+        return;
     const int chars = MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, nullptr, 0);
-    if (chars <= 0) {
-        g_clipboardError.store(ERROR_NO_UNICODE_TRANSLATION);
-        return false;
-    }
+    if (chars <= 0)
+        return;
     std::wstring wide(static_cast<size_t>(chars), L'\0');
-    if (MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, &wide[0], chars) <= 0) {
-        g_clipboardError.store(ERROR_NO_UNICODE_TRANSLATION);
-        return false;
-    }
+    MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, &wide[0], chars);
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, wide.size() * sizeof(wchar_t));
-    if (!memory) {
-        g_clipboardError.store(GetLastError());
-        return false;
-    }
+    if (!memory)
+        return;
     void* target = GlobalLock(memory);
     if (!target) {
-        const DWORD error = GetLastError();
         GlobalFree(memory);
-        g_clipboardError.store(error);
-        return false;
+        return;
     }
     std::memcpy(target, wide.c_str(), wide.size() * sizeof(wchar_t));
     GlobalUnlock(memory);
-    if (!OpenClipboard(nullptr)) {
-        const DWORD error = GetLastError();
+    if (!OpenClipboard(g_gameWindow)) {
         GlobalFree(memory);
-        g_clipboardError.store(error);
-        return false;
+        return;
     }
-    if (!EmptyClipboard()) {
-        const DWORD error = GetLastError();
-        CloseClipboard();
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, memory))
         GlobalFree(memory);
-        g_clipboardError.store(error);
-        return false;
-    }
-    if (!SetClipboardData(CF_UNICODETEXT, memory)) {
-        const DWORD error = GetLastError();
-        CloseClipboard();
-        GlobalFree(memory);
-        g_clipboardError.store(error);
-        return false;
-    }
-    // Ownership of memory transfers to the system after successful SetClipboardData.
     CloseClipboard();
-    g_clipboardError.store(ERROR_SUCCESS);
-    return true;
 }
 
 bool IsGameForeground()
@@ -489,130 +660,121 @@ bool IsGameForeground()
     return processId == GetCurrentProcessId();
 }
 
-bool IsAltDown()
-{
-    return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
-           (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0 ||
-           (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
-}
-
-bool IsControlDown()
-{
-    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-           (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-           (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
-}
-
-std::string GetInputBufferSnapshot()
-{
-    std::lock_guard<std::mutex> lock(g_inputMutex);
-    return g_inputBuffer;
-}
-
-void ClearInputBuffer()
-{
-    std::lock_guard<std::mutex> lock(g_inputMutex);
-    g_inputBuffer.clear();
-}
-
 void AppendIpCharacter(char character)
 {
     constexpr size_t kMaximumInputLength = 64;
-    std::lock_guard<std::mutex> lock(g_inputMutex);
-    g_copiedFeedback = false;
     if (g_inputBuffer.size() < kMaximumInputLength)
         g_inputBuffer.push_back(character);
 }
 
-void RemoveLastIpCharacter()
+bool IsAsciiDigit(wchar_t value)
 {
-    std::lock_guard<std::mutex> lock(g_inputMutex);
-    g_copiedFeedback = false;
-    if (!g_inputBuffer.empty())
-        g_inputBuffer.pop_back();
+    return value >= L'0' && value <= L'9';
 }
 
-void CopyInputToClipboardAndClear()
+bool ParseIpPortNumber(const std::wstring& source, size_t& position, size_t maxDigits,
+    unsigned long maximum, unsigned long& value)
 {
-    const std::string value = GetInputBufferSnapshot();
-    if (value.empty()) {
-        g_clipboardStatus.store(0);
-        ClearInputBuffer();
-        {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
-            g_copiedFeedback = true;
-            g_copiedFeedbackUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-        }
-        return;
+    const size_t start = position;
+    value = 0;
+    while (position < source.size() && IsAsciiDigit(source[position]) && position - start < maxDigits) {
+        value = value * 10UL + static_cast<unsigned long>(source[position] - L'0');
+        ++position;
     }
+    if (position == start || (position < source.size() && IsAsciiDigit(source[position])) || value > maximum)
+        return false;
+    return true;
+}
 
-    if (SetClipboardText(value)) {
-        g_clipboardStatus.store(1);
-        ClearInputBuffer();
-        {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
-            g_copiedFeedback = true;
-            g_copiedFeedbackUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+bool TryExtractIpPortAt(const std::wstring& source, size_t start, size_t& end)
+{
+    if (start >= source.size() || !IsAsciiDigit(source[start]))
+        return false;
+    if (start > 0 && IsAsciiDigit(source[start - 1]))
+        return false;
+
+    size_t position = start;
+    unsigned long value = 0;
+    for (int octet = 0; octet < 4; ++octet) {
+        if (!ParseIpPortNumber(source, position, 3, 255, value))
+            return false;
+        if (octet != 3) {
+            if (position >= source.size() || source[position] != L'.')
+                return false;
+            ++position;
         }
-    } else {
-        // Preserve the text so the user can retry if Windows denies clipboard access.
-        g_clipboardStatus.store(2);
     }
+    if (position >= source.size() || source[position] != L':')
+        return false;
+    ++position;
+    if (!ParseIpPortNumber(source, position, 5, 99999, value))
+        return false;
+    if (position < source.size() && IsAsciiDigit(source[position]))
+        return false;
+    end = position;
+    return true;
+}
+
+bool ExtractFirstValidIpPort(const std::wstring& source, std::string& result)
+{
+    result.clear();
+    for (size_t start = 0; start < source.size(); ++start) {
+        if (!IsAsciiDigit(source[start]))
+            continue;
+        size_t end = start;
+        if (!TryExtractIpPortAt(source, start, end))
+            continue;
+        result.reserve(end - start);
+        for (size_t i = start; i < end; ++i)
+            result.push_back(static_cast<char>(source[i]));
+        return true;
+    }
+    return false;
 }
 
 bool PasteClipboardIp()
 {
-    if (!OpenClipboard(nullptr))
+    if (!OpenClipboard(g_overlayWindow))
         return false;
-
     HANDLE clipboardData = GetClipboardData(CF_UNICODETEXT);
     if (!clipboardData) {
         CloseClipboard();
         return false;
     }
-
     const wchar_t* source = static_cast<const wchar_t*>(GlobalLock(clipboardData));
     if (!source) {
         CloseClipboard();
         return false;
     }
-
-    std::wstring value(source);
+    const std::wstring value(source);
     GlobalUnlock(clipboardData);
     CloseClipboard();
 
-    size_t first = 0;
-    while (first < value.size() && iswspace(value[first])) ++first;
-    size_t last = value.size();
-    while (last > first && iswspace(value[last - 1])) --last;
-    if (first == last || last - first > 64)
-        return false;
-
+    // Keep only the first valid IPv4:port in arbitrary copied text.
     std::string normalized;
-    normalized.reserve(last - first);
-    for (size_t i = first; i < last; ++i) {
-        const wchar_t c = value[i];
-        if ((c >= L'0' && c <= L'9') || c == L'.' || c == L':')
-            normalized.push_back(static_cast<char>(c));
-        // Ignore unsupported characters instead of rejecting the entire paste.
-    }
-
+    if (!ExtractFirstValidIpPort(value, normalized))
+        return false;
     constexpr size_t kMaximumInputLength = 64;
-    if (normalized.size() > kMaximumInputLength)
-        normalized.resize(kMaximumInputLength);
-    std::lock_guard<std::mutex> lock(g_inputMutex);
-    g_copiedFeedback = false;
-    g_inputBuffer = normalized;
+    if (g_inputBuffer.size() + normalized.size() > kMaximumInputLength)
+        return false;
+    g_inputBuffer += normalized;
     return true;
 }
 
 bool IsAltPressed(const KBDLLHOOKSTRUCT& key)
 {
-    return IsAltDown() || (key.flags & LLKHF_ALTDOWN) != 0;
+    return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 || (key.flags & LLKHF_ALTDOWN) != 0;
+}
+
+bool IsControlPressed()
+{
+    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 }
 
 bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
 {
+    // Handle the most common input directly. This avoids depending on the
+    // hook thread's asynchronous keyboard state for the number row.
     if (vk >= '0' && vk <= '9' && (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0) {
         result = static_cast<char>(vk);
         return true;
@@ -626,16 +788,17 @@ bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
         return true;
     }
 
+    // Translate through the active Windows keyboard layout so punctuation works
+    // on Japanese/JIS keyboards instead of relying on only US virtual-key codes.
     BYTE state[256]{};
     if (GetKeyboardState(state)) {
         state[vk] |= 0x80;
         if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) state[VK_SHIFT] |= 0x80;
         else state[VK_SHIFT] &= 0x7f;
-        if (IsControlDown()) state[VK_CONTROL] |= 0x80;
+        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) state[VK_CONTROL] |= 0x80;
         if (IsAltPressed(key)) state[VK_MENU] |= 0x80;
         wchar_t translated[8]{};
-        const UINT scan = key.scanCode ? key.scanCode : MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-        const int count = ToUnicodeEx(vk, scan, state, translated,
+        const int count = ToUnicodeEx(vk, key.scanCode, state, translated,
             static_cast<int>(_countof(translated)), 0, GetKeyboardLayout(0));
         if (count == 1) {
             const wchar_t c = translated[0];
@@ -646,6 +809,7 @@ bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
         }
     }
 
+    // Fallbacks cover numpad digits and punctuation mappings when translation fails.
     if (vk == VK_OEM_PERIOD && (GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0) {
         result = '.';
         return true;
@@ -659,17 +823,53 @@ bool TryGetIpCharacter(DWORD vk, const KBDLLHOOKSTRUCT& key, char& result)
 
 LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM message, LPARAM data)
 {
-    if (code >= 0 && data != 0 &&
-        (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-        g_inputEnabled && g_sceneId == 2) {
-        const auto& key = *reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
-        g_inputHookEvents.fetch_add(1);
-        g_inputLastVirtualKey.store(key.vkCode);
+    if (code < 0 || data == 0)
+        return CallNextHookEx(g_keyboardHook, code, message, data);
+
+    const auto& key = *reinterpret_cast<KBDLLHOOKSTRUCT*>(data);
+    const DWORD vk = key.vkCode;
+    const bool isDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+    const bool isUp = message == WM_KEYUP || message == WM_SYSKEYUP;
+
+    // Consume the key-up matching any intercepted key-down, even after a scene change.
+    if (isUp && vk < _countof(g_suppressedKeys) && g_suppressedKeys[vk]) {
+        g_suppressedKeys[vk] = false;
+        return 1;
+    }
+    if (!isDown || !g_inputEnabled || g_sceneId != 2 || !IsGameForeground())
+        return CallNextHookEx(g_keyboardHook, code, message, data);
+
+    bool consume = false;
+    if (vk == VK_RETURN) {
+        // Alt+Enter must reach the vanilla game to toggle fullscreen.
+        if (IsAltPressed(key))
+            return CallNextHookEx(g_keyboardHook, code, message, data);
+        SetClipboardText(g_inputBuffer);
+        g_inputBuffer.clear();
+        UpdateInputText();
+        consume = true;
+    } else if (vk == VK_BACK && !IsAltPressed(key) && !IsControlPressed()) {
+        if (!g_inputBuffer.empty()) g_inputBuffer.pop_back();
+        UpdateInputText();
+        consume = true;
+    } else if (vk == 'V' && IsControlPressed() && !IsAltPressed(key)) {
+        PasteClipboardIp();
+        UpdateInputText();
+        consume = true;
+    } else if (!IsAltPressed(key) && !IsControlPressed()) {
+        char character = 0;
+        if (TryGetIpCharacter(vk, key, character)) {
+            AppendIpCharacter(character);
+            UpdateInputText();
+            consume = true;
+        }
     }
 
-    // Diagnostic only. Actual IP input polling runs on the overlay thread,
-    // so it also works on the title/menu screen before BattleManager is active.
-    return CallNextHookEx(g_keyboardHook, code, message, data);
+    if (!consume)
+        return CallNextHookEx(g_keyboardHook, code, message, data);
+    if (vk < _countof(g_suppressedKeys)) g_suppressedKeys[vk] = true;
+    RequestInputRedraw();
+    return 1;
 }
 
 BOOL CALLBACK FindGameWindowCallback(HWND window, LPARAM parameter)
@@ -707,13 +907,15 @@ HWND FindGameWindow()
 
 void RefreshDatabase()
 {
-    const std::wstring path = FindDefaultDatabase();
+    const std::wstring path = g_configuredTskDatabasePath;
     if (path != g_databasePath) {
         g_databasePath = path;
         if (path.empty())
             g_database.reset();
         else
             g_database = std::make_unique<TskDatabase>(path);
+        g_dbSize = 0;
+        g_dbWriteTime = {};
         g_normalStatsValid = g_watchP1StatsValid = g_watchP2StatsValid = false;
         g_cachedNormalProfile.clear();
         g_cachedWatchingP1.clear();
@@ -723,12 +925,14 @@ void RefreshDatabase()
 
 bool DatabaseChanged()
 {
-    if (g_databasePath.empty())
-        return true;
     std::uintmax_t size = 0;
     FILETIME writeTime{};
-    if (!ReadFileInfo(g_databasePath, size, writeTime))
-        return true;
+    if (g_databasePath.empty() || !ReadFileInfo(g_databasePath, size, writeTime)) {
+        const bool wasPresent = g_dbSize != 0 || g_dbWriteTime.dwLowDateTime != 0 || g_dbWriteTime.dwHighDateTime != 0;
+        g_dbSize = 0;
+        g_dbWriteTime = {};
+        return wasPresent;
+    }
     const bool changed = size != g_dbSize || !IsFileTimeEqual(writeTime, g_dbWriteTime);
     if (changed) {
         g_dbSize = size;
@@ -758,19 +962,19 @@ void RefreshStats(bool force)
     if (force || g_cachedNormalProfile != g_opponentProfile) {
         g_normalStats = {};
         g_normalStatsValid = !g_opponentProfile.empty() &&
-            g_database->GetOpponentStats(g_opponentProfile, g_normalStats);
+            g_database->GetOpponentStats(ProfilesForStats(g_opponentProfile), g_normalStats);
         g_cachedNormalProfile = g_opponentProfile;
     }
     if (force || g_cachedWatchingP1 != g_watchingP1Profile) {
         g_watchP1Stats = {};
         g_watchP1StatsValid = !g_watchingP1Profile.empty() &&
-            g_database->GetOpponentStats(g_watchingP1Profile, g_watchP1Stats);
+            g_database->GetOpponentStats(ProfilesForStats(g_watchingP1Profile), g_watchP1Stats);
         g_cachedWatchingP1 = g_watchingP1Profile;
     }
     if (force || g_cachedWatchingP2 != g_watchingP2Profile) {
         g_watchP2Stats = {};
         g_watchP2StatsValid = !g_watchingP2Profile.empty() &&
-            g_database->GetOpponentStats(g_watchingP2Profile, g_watchP2Stats);
+            g_database->GetOpponentStats(ProfilesForStats(g_watchingP2Profile), g_watchP2Stats);
         g_cachedWatchingP2 = g_watchingP2Profile;
     }
 }
@@ -785,24 +989,20 @@ bool UpdateSceneState()
 
     const int oldScene = g_sceneId;
     g_sceneId = scene;
-
-    // A new character-select / spectator-loading session starts enabled by default.
-    // Once F10 disables the overlay, keep it disabled until the game returns to SceneID <= 7.
-    if (scene <= 7) {
-        g_overlayManuallyDisabledForSession = false;
-    } else if ((scene == 8 || scene == 9 || scene == 12) && oldScene <= 7) {
-        if (!g_overlayManuallyDisabledForSession) {
-            g_overlayEnabled.store(true);
-            RequestInfoRedraw();
-        }
-    }
-
     if (scene <= 7) {
         g_clientMode = false;
         g_opponentProfile.clear();
         g_normalStats = {};
         g_normalStatsValid = false;
         g_cachedNormalProfile.clear();
+        g_overlayManuallyDisabledForSession = false;
+    } else if ((scene == 8 || scene == 9 || scene == 12 || scene == 15) && oldScene <= 7) {
+        if (!g_overlayManuallyDisabledForSession) {
+            g_overlayEnabled = g_defaultOverlayVisible;
+            RequestInfoRedraw();
+        }
+        if (scene == 9)
+            g_clientMode = true;
     } else if (scene == 9) {
         // OIV remembers client mode until the scene returns below 8.
         g_clientMode = true;
@@ -810,10 +1010,10 @@ bool UpdateSceneState()
 
     // SceneID 2 only. Any transition out clears the pending input immediately.
     if (scene == 2) {
-        ClearInputBuffer();
+        g_inputBuffer.clear();
         g_inputEnabled = true;
     } else {
-        ClearInputBuffer();
+        g_inputBuffer.clear();
         g_inputEnabled = false;
     }
 
@@ -833,7 +1033,7 @@ bool UpdateSceneState()
             g_watchP2StatsValid = false;
             g_cachedWatchingP2.clear();
         }
-    } else if (scene >= 8 && scene <= 11) {
+    } else if (scene >= 8 && scene <= 14) {
         const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
         const std::string opponent = ReadProfile(offset);
         if (opponent != g_opponentProfile) {
@@ -859,25 +1059,8 @@ void RequestInfoRedraw() { RequestWindowRedraw(g_overlayWindow); }
 void RequestInputRedraw() { RequestWindowRedraw(g_inputWindow); }
 void RequestWarningRedraw() { RequestWindowRedraw(g_warningWindow); }
 
-void RepositionVisibleLayer(HWND window, const LayerBounds& bounds)
-{
-    if (!window || !bounds.valid || !IsWindowVisible(window) || !g_haveLastGameClientRect)
-        return;
-    SetWindowPos(window, nullptr,
-        g_lastGameClientRect.left + bounds.offsetX,
-        g_lastGameClientRect.top + bounds.offsetY,
-        bounds.width, bounds.height,
-        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
-}
-
 void RaiseOverlayLayers()
 {
-    // Keep each surface attached to the game's client area even when Alt+Enter
-    // changes the display mode between content redraws.
-    RepositionVisibleLayer(g_overlayWindow, g_infoLayerBounds);
-    RepositionVisibleLayer(g_inputWindow, g_inputLayerBounds);
-    RepositionVisibleLayer(g_warningWindow, g_warningLayerBounds);
-
     const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
     if (g_overlayWindow && IsWindow(g_overlayWindow))
         SetWindowPos(g_overlayWindow, HWND_TOPMOST, 0, 0, 0, 0, flags);
@@ -898,7 +1081,7 @@ void UpdateInfoText()
 {
     std::vector<std::wstring> next;
     if (g_overlayEnabled) {
-        if (IsNormalInfoScene(g_sceneId))
+        if (g_sceneId >= 8 && g_sceneId <= 11)
             SplitLines(BuildNormalInfo(), next);
         else if (g_sceneId == 12 || g_sceneId == 15)
             SplitLines(BuildWatchingInfo(), next);
@@ -910,19 +1093,10 @@ void UpdateInfoText()
 void UpdateInputText()
 {
     std::wstring next;
-    std::lock_guard<std::mutex> lock(g_inputMutex);
-    if (g_copiedFeedback && std::chrono::steady_clock::now() >= g_copiedFeedbackUntil)
-        g_copiedFeedback = false;
-    if (g_inputEnabled && g_sceneId == 2) {
-        if (g_copiedFeedback)
-            next = L"IP:Port ＞ Copied";
-        else
-            next = L"IP:Port ＞ " + NarrowAsciiToWide(g_inputBuffer) + L"_";
-    }
-    if (next != g_inputLine) {
+    if (g_inputEnabled && g_sceneId == 2)
+        next = L"IP:Port ＞ " + NarrowAsciiToWide(g_inputBuffer) + L"_";
+    if (next != g_inputLine)
         g_inputLine = std::move(next);
-        RequestInputRedraw();
-    }
 }
 
 void DrawTextLine(HDC dc, const std::wstring& line, int x, int y, int width, int height, COLORREF color, HFONT font,
@@ -1067,17 +1241,6 @@ void RenderLayerSurface(HWND window, int x, int y, int width, int height,
     SIZE size{ width, height };
     BLENDFUNCTION blend{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
     if (UpdateLayeredWindow(window, screenDc, &destination, &size, dc, &source, 0, &blend, ULW_ALPHA)) {
-        LayerBounds* savedBounds = nullptr;
-        if (window == g_overlayWindow) savedBounds = &g_infoLayerBounds;
-        else if (window == g_inputWindow) savedBounds = &g_inputLayerBounds;
-        else if (window == g_warningWindow) savedBounds = &g_warningLayerBounds;
-        if (savedBounds && g_haveLastGameClientRect) {
-            savedBounds->offsetX = x - g_lastGameClientRect.left;
-            savedBounds->offsetY = y - g_lastGameClientRect.top;
-            savedBounds->width = width;
-            savedBounds->height = height;
-            savedBounds->valid = true;
-        }
         if (!IsWindowVisible(window))
             ShowWindow(window, SW_SHOWNOACTIVATE);
         // Alt+Enter / fullscreen transitions can disturb the Z-order of
@@ -1100,10 +1263,6 @@ void RenderLayerSurface(HWND window, int x, int y, int width, int height,
 
 void PaintInfoLayer(HWND window)
 {
-    // WM_PAINT can occur independently of our posted refresh message. Rebuild
-    // the same info text used by both normal and spectator views here as well,
-    // so entering SceneID 8-11 cannot leave the info layer with stale/empty lines.
-    UpdateInfoText();
     const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
     const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
     if (!g_haveLastGameClientRect || !g_overlayEnabled || g_infoLines.empty() || gameWidth <= 0 || gameHeight <= 0) {
@@ -1131,8 +1290,7 @@ void PaintInfoLayer(HWND window)
 
     int fontHeight = lineHeight < 14 ? (std::max)(8, lineHeight - 2) : 12;
     const int panelHeight = static_cast<int>(lines.size()) * lineHeight + 12;
-    // Center the information window vertically rather than keeping it near the top third.
-    int top = (std::max)(22, (gameHeight - panelHeight) / 2);
+    int top = 22;
     if (top + panelHeight > gameHeight - 8) top = (std::max)(8, gameHeight - panelHeight - 8);
     const int left = 12;
     const COLORREF background = RGB(8, 8, 12);
@@ -1160,41 +1318,33 @@ void PaintInputLayer(HWND window)
         return;
     }
 
-    std::wstring inputLine;
-    size_t inputLength = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_inputMutex);
-        inputLine = g_inputLine;
-        inputLength = g_inputBuffer.size();
-    }
-
-    const std::wstring help = L"1~9 / . / : / BS / Enter / Ctrl+V";
     const COLORREF background = RGB(10, 10, 10);
+    const std::wstring help = g_keyboardHook
+        ? L"数字・.・: / Backspace / Enterでクリップボードへコピー"
+        : L"キーボード入力を初期化中...";
     HDC measureDc = GetDC(nullptr);
     if (!measureDc) return;
-    HFONT font = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+    HFONT font = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
     HGDIOBJ oldFont = SelectObject(measureDc, font);
-    const int maxPanelWidth = (std::max)(120, (std::min)(gameWidth - 24, 520));
-    int requestedWidth = TextPixelWidth(measureDc, inputLine);
-    requestedWidth = (std::max)(requestedWidth, TextPixelWidth(measureDc, help));
-
-    const int panelWidth = (std::min)(maxPanelWidth, (std::max)(190, requestedWidth + 18));
+    const int maxPanelWidth = (std::max)(120, (std::min)(gameWidth - 24, 480));
+    const int panelWidth = (std::min)(maxPanelWidth, (std::max)(160,
+        (std::max)(TextPixelWidth(measureDc, g_inputLine), TextPixelWidth(measureDc, help)) + 18));
     SelectObject(measureDc, oldFont);
     DeleteObject(font);
     ReleaseDC(nullptr, measureDc);
 
-    const int panelHeight = 42;
+    const int panelHeight = 44;
     const int left = 12;
     const int top = (std::max)(8, gameHeight - panelHeight - 14);
     RenderLayerSurface(window, g_lastGameClientRect.left + left, g_lastGameClientRect.top + top,
         panelWidth, panelHeight, [=](HDC dc, std::vector<AlphaFill>& fills) {
-            HFONT drawFont = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
+            HFONT drawFont = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
             RECT panel{ 0, 0, panelWidth, panelHeight };
-            DrawAndRegisterPanel(dc, panel, background, 190, RGB(90, 145, 110), fills);
-            DrawTextLine(dc, inputLine, 8, 2, panelWidth - 16, 18, RGB(255, 255, 255), drawFont);
-            DrawTextLine(dc, help, 8, 20, panelWidth - 16, 18, RGB(190, 220, 200), drawFont);
+            DrawAndRegisterPanel(dc, panel, background, 180, RGB(90, 145, 110), fills);
+            DrawTextLine(dc, g_inputLine, 8, 3, panelWidth - 16, 20, RGB(255, 255, 255), drawFont);
+            DrawTextLine(dc, help, 8, 23, panelWidth - 16, 17, RGB(190, 220, 200), drawFont);
             DeleteObject(drawFont);
         });
 }
@@ -1270,10 +1420,6 @@ LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM
     case WM_ERASEBKGND:
         return 1;
     case kRefreshMessage:
-        if (window == g_inputWindow)
-            UpdateInputText();
-        else if (window == g_overlayWindow)
-            UpdateInfoText();
         PaintOverlay(window);
         return 0;
     case WM_NCHITTEST:
@@ -1286,95 +1432,6 @@ LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM
     default:
         return DefWindowProcW(window, message, wParam, lParam);
     }
-}
-
-void PollIpInputFromGameFrame()
-{
-    // Poll both top-row and numpad keys once per game frame. Edge detection
-    // avoids repeated characters when a key is held down.
-    static const DWORD keysToPoll[] = {
-        '0','1','2','3','4','5','6','7','8','9',
-        VK_NUMPAD0,VK_NUMPAD1,VK_NUMPAD2,VK_NUMPAD3,VK_NUMPAD4,
-        VK_NUMPAD5,VK_NUMPAD6,VK_NUMPAD7,VK_NUMPAD8,VK_NUMPAD9,
-        VK_DECIMAL, VK_OEM_PERIOD, VK_OEM_1, VK_OEM_PLUS,
-        VK_BACK, VK_RETURN, 'V'
-    };
-
-    const bool inputMode = g_inputEnabled.load() && g_sceneId.load() == 2 && IsGameForeground();
-    for (DWORD vk : keysToPoll) {
-        const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
-        const bool pressed = down && !g_previousPolledKeyDown[vk];
-        g_previousPolledKeyDown[vk] = down;
-        if (!pressed || !inputMode)
-            continue;
-
-        g_inputPollEvents.fetch_add(1);
-        g_inputLastPolledVirtualKey.store(vk);
-
-        // Alt+Enter must be left entirely to the game for fullscreen switching.
-        if (vk == VK_RETURN && IsAltDown())
-            continue;
-
-        bool handled = false;
-        if (vk == VK_RETURN) {
-            CopyInputToClipboardAndClear();
-            handled = true;
-        } else if (vk == 'V' && IsControlDown()) {
-            g_pasteStatus.store(PasteClipboardIp() ? 1 : 2);
-            handled = true;
-        } else if (IsControlDown()) {
-            // Do not interpret modified shortcuts as IP characters.
-            continue;
-        } else if (vk == VK_BACK) {
-            RemoveLastIpCharacter();
-            handled = true;
-        } else {
-            KBDLLHOOKSTRUCT key{};
-            key.vkCode = vk;
-            key.scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-            char character = 0;
-            if (TryGetIpCharacter(vk, key, character)) {
-                AppendIpCharacter(character);
-                handled = true;
-            }
-        }
-
-        if (handled) {
-            UpdateInputText();
-            RequestInputRedraw();
-        }
-    }
-}
-
-int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
-{
-    // F10 is polled asynchronously by the overlay thread so it also works while
-    // loading spectator matches, before BattleManager::onProcess is running.
-    if (g_originalBattleManagerOnProcess)
-        return (self->*g_originalBattleManagerOnProcess)();
-    return 0;
-}
-
-bool InstallBattleManagerProcessHook()
-{
-    void* slot = static_cast<void*>(&SokuLib::VTable_BattleManager.onProcess);
-    DWORD oldProtection = 0;
-    if (!VirtualProtect(slot, sizeof(DWORD), PAGE_EXECUTE_READWRITE, &oldProtection)) {
-        OutputDebugStringW(L"[OIOverlay] Could not make BattleManager::onProcess writable.\n");
-        return false;
-    }
-
-    g_originalBattleManagerOnProcess = SokuLib::TamperDword(
-        &SokuLib::VTable_BattleManager.onProcess, HookBattleManagerOnProcess);
-
-    DWORD ignored = 0;
-    VirtualProtect(slot, sizeof(DWORD), oldProtection, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(DWORD));
-    if (!g_originalBattleManagerOnProcess) {
-        OutputDebugStringW(L"[OIOverlay] BattleManager::onProcess hook failed.\n");
-        return false;
-    }
-    return true;
 }
 
 bool InstallKeyboardHook()
@@ -1424,15 +1481,19 @@ DWORD WINAPI OverlayThread(void*)
     }
 
     // Per-pixel transparency is applied by UpdateLayeredWindow, not SetLayeredWindowAttributes.
-    // The low-level hook is diagnostic only; input is polled from the game's frame hook.
+    // Keyboard input must be intercepted by a low-level hook so ordinary game keys
+    // are swallowed while SceneID == 2; Alt+Enter is deliberately passed through.
     InstallKeyboardHook();
     g_lastKeyboardHookCheck = Clock::now();
-    g_databasePath = FindDefaultDatabase();
+    LoadOverlaySettings();
+    g_overlayEnabled = g_defaultOverlayVisible;
+    g_databasePath = g_configuredTskDatabasePath;
     if (!g_databasePath.empty())
         g_database = std::make_unique<TskDatabase>(g_databasePath);
 
     g_tskRunning = IsTskRunning();
-    g_tskWarningState = g_tskRunning ? TskWarningState::None : TskWarningState::NotRunning;
+    g_tskWarningState = !g_tskRunning ? TskWarningState::NotRunning
+        : (IsTskDetectingGame() ? TskWarningState::None : TskWarningState::GameNotDetected);
     g_lastTskCheck = Clock::now();
     g_lastDbCheck = Clock::now();
     g_lastWarningBlink = Clock::now();
@@ -1449,19 +1510,7 @@ DWORD WINAPI OverlayThread(void*)
         }
         const auto now = Clock::now();
 
-        // Async F10 polling: do not depend on BattleManager::onProcess, which may
-        // not run during character-select or spectator loading. Ignore SceneID <= 7.
-        const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-        if (g_sceneId.load() > 7 && IsGameForeground() && f10Down && !g_previousAsyncF10Down) {
-            const bool enable = !g_overlayEnabled.load();
-            g_overlayEnabled.store(enable);
-            if (!enable)
-                g_overlayManuallyDisabledForSession = true;
-            RequestInfoRedraw();
-        }
-        g_previousAsyncF10Down = f10Down;
-
-        if (now - g_lastWindowSearch >= std::chrono::milliseconds(35) || !g_gameWindow) {
+        if (now - g_lastWindowSearch >= std::chrono::milliseconds(300) || !g_gameWindow) {
             HWND found = FindGameWindow();
             if (found != g_gameWindow) {
                 g_gameWindow = found;
@@ -1478,7 +1527,7 @@ DWORD WINAPI OverlayThread(void*)
                 ShowWindow(g_warningWindow, SW_HIDE);
                 g_overlayWasVisible = false;
             }
-            Sleep(35);
+            Sleep(20);
             continue;
         }
         if (!g_overlayWasVisible) {
@@ -1486,35 +1535,26 @@ DWORD WINAPI OverlayThread(void*)
             RequestRedraw();
         }
 
-        if (now - g_lastGeometryCheck >= std::chrono::milliseconds(35)) {
+        if (now - g_lastGeometryCheck >= std::chrono::milliseconds(100)) {
             RECT client{};
-            RECT windowRect{};
-            if (GetClientRect(g_gameWindow, &client) && GetWindowRect(g_gameWindow, &windowRect)) {
+            if (GetClientRect(g_gameWindow, &client)) {
                 POINT origin{ client.left, client.top };
                 ClientToScreen(g_gameWindow, &origin);
                 const int w = static_cast<int>((std::max)(static_cast<LONG>(1), static_cast<LONG>(client.right - client.left)));
                 const int h = static_cast<int>((std::max)(static_cast<LONG>(1), static_cast<LONG>(client.bottom - client.top)));
-                const LONG_PTR windowStyle = GetWindowLongPtrW(g_gameWindow, GWL_STYLE);
-                const LONG_PTR windowExStyle = GetWindowLongPtrW(g_gameWindow, GWL_EXSTYLE);
                 const bool changed = !g_haveLastGameClientRect || g_lastLocatedGameWindow != g_gameWindow ||
                     g_lastGameClientRect.left != origin.x || g_lastGameClientRect.top != origin.y ||
-                    g_lastGameClientRect.right != origin.x + w || g_lastGameClientRect.bottom != origin.y + h ||
-                    g_lastGameWindowRect.left != windowRect.left || g_lastGameWindowRect.top != windowRect.top ||
-                    g_lastGameWindowRect.right != windowRect.right || g_lastGameWindowRect.bottom != windowRect.bottom ||
-                    g_lastGameWindowStyle != windowStyle || g_lastGameWindowExStyle != windowExStyle;
+                    g_lastGameClientRect.right != origin.x + w || g_lastGameClientRect.bottom != origin.y + h;
                 if (changed) {
                     g_lastGameClientRect = RECT{ origin.x, origin.y, origin.x + w, origin.y + h };
-                    g_lastGameWindowRect = windowRect;
-                    g_lastGameWindowStyle = windowStyle;
-                    g_lastGameWindowExStyle = windowExStyle;
                     g_lastLocatedGameWindow = g_gameWindow;
                     g_haveLastGameClientRect = true;
-                    // A mode/style/position change is a real viewport event; re-render each independent layer.
+                    // Layer windows stay independent; re-render their own regions after viewport changes.
                     RequestRedraw();
                 }
             }
-            // Match the earlier working overlay's fast placement cadence. The three
-            // layers stay independent; only their Z-order is touched on stable frames.
+            // Reassert Z-order even when client bounds are unchanged: exclusive
+            // fullscreen can reorder layered windows without changing the rectangle.
             RaiseOverlayLayers();
             g_lastGeometryCheck = now;
         }
@@ -1527,11 +1567,11 @@ DWORD WINAPI OverlayThread(void*)
 
         if (now - g_lastTskCheck >= std::chrono::milliseconds(300)) {
             const bool nowRunning = IsTskRunning();
-            if (nowRunning != g_tskRunning) {
-                const bool wasRunning = g_tskRunning;
+            const TskWarningState nextWarning = !nowRunning ? TskWarningState::NotRunning
+                : (IsTskDetectingGame() ? TskWarningState::None : TskWarningState::GameNotDetected);
+            if (nowRunning != g_tskRunning || nextWarning != g_tskWarningState) {
                 g_tskRunning = nowRunning;
-                g_tskWarningState = !nowRunning ? TskWarningState::NotRunning
-                    : (wasRunning ? TskWarningState::None : TskWarningState::GameNotDetected);
+                g_tskWarningState = nextWarning;
                 g_warningBlink = false;
                 g_lastWarningBlink = now;
                 RequestWarningRedraw();
@@ -1541,7 +1581,7 @@ DWORD WINAPI OverlayThread(void*)
 
         const bool sceneChanged = UpdateSceneState();
         if (sceneChanged) {
-            if (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15)
+            if ((g_sceneId >= 8 && g_sceneId <= 11) || g_sceneId == 12 || g_sceneId == 15)
                 RefreshStats(true);
             UpdateInfoText();
             UpdateInputText();
@@ -1550,15 +1590,20 @@ DWORD WINAPI OverlayThread(void*)
             g_lastCharacterRefresh = now;
         }
 
-        // Poll IP input independently of BattleManager::onProcess so it works
-        // on SceneID 2 even when the game is at the title/menu screen.
-        PollIpInputFromGameFrame();
-        UpdateInputText();
+        const bool toggleDown = g_toggleKey != 0 && (GetAsyncKeyState(g_toggleKey) & 0x8000) != 0;
+        if (g_sceneId > 7 && IsGameForeground() && toggleDown && !g_previousToggleKeyDown) {
+            g_overlayEnabled = !g_overlayEnabled;
+            if (!g_overlayEnabled)
+                g_overlayManuallyDisabledForSession = true;
+            UpdateInfoText();
+            RequestInfoRedraw();
+        }
+        g_previousToggleKeyDown = toggleDown;
 
         // Only the information layer refreshes once per second in character-select.
         // Spectator records are re-read only on SceneID transitions.
-        if (g_overlayEnabled && IsNormalInfoScene(g_sceneId) &&
-            (g_infoLines.empty() || now - g_lastCharacterRefresh >= std::chrono::seconds(1))) {
+        if (g_sceneId >= 8 && g_sceneId <= 11 &&
+            now - g_lastCharacterRefresh >= std::chrono::seconds(1)) {
             const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
             const std::string opponent = ReadProfile(offset);
             if (!opponent.empty() && opponent != g_opponentProfile) {
@@ -1575,7 +1620,11 @@ DWORD WINAPI OverlayThread(void*)
 
         if (now - g_lastDbCheck >= std::chrono::milliseconds(500)) {
             RefreshDatabase();
-            (void)DatabaseChanged();
+            if (DatabaseChanged() && g_sceneId >= 8 && g_sceneId <= 15) {
+                RefreshStats(true);
+                UpdateInfoText();
+                RequestInfoRedraw();
+            }
             g_lastDbCheck = now;
         }
 
@@ -1585,7 +1634,7 @@ DWORD WINAPI OverlayThread(void*)
             g_lastWarningBlink = now;
             RequestWarningRedraw();
         }
-        Sleep(8);
+        Sleep(20);
     }
 
     if (g_keyboardHook) {
@@ -1610,8 +1659,6 @@ extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16])
 extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE)
 {
     g_module = hMyModule;
-    if (!InstallBattleManagerProcessHook())
-        return false;
     HANDLE thread = CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
     if (!thread)
         return false;
