@@ -51,7 +51,6 @@ volatile LONG g_stopRequested = 0;
 std::atomic<int> g_sceneId{-1};
 bool g_clientMode = false;
 std::atomic<bool> g_overlayEnabled{true};
-bool g_previousProcessF10Down = false;
 bool g_previousAsyncF10Down = false;
 bool g_overlayManuallyDisabledForSession = false;
 bool g_tskRunning = false;
@@ -332,7 +331,7 @@ std::wstring WatchRateLine(const wchar_t* label, const TskStats& p1, const TskSt
 auto rateFor = [](const TskStats& stats) -> std::wstring {
 if (!stats.found)
 return L"---.-%";
-return RateText(stats.totalWins, stats.totalLosses);
+return RateText(stats.totalLosses, stats.totalWins);
 };
 std::wstring a = rateFor(p1);
 std::wstring b = rateFor(p2);
@@ -410,7 +409,7 @@ text += WatchRateLine(L"通算", g_watchP1Stats, g_watchP2Stats) + L"\n";
 auto recentRate = [](const TskStats& s, int period) -> std::wstring {
 if (!s.found) return L"---.-%";
 const TskPeriodStats* p = period == 30 ? &s.last30 : period == 100 ? &s.last100 : &s.lastMonth;
-return RateText(p->wins, p->losses);
+return RateText(p->losses, p->wins);
 };
 std::wstring r1 = recentRate(g_watchP1Stats, 30), r2 = recentRate(g_watchP2Stats, 30);
 if (r1.size() < 6) r1.insert(r1.begin(), 6 - r1.size(), L' ');
@@ -555,13 +554,11 @@ void CopyInputToClipboardAndClear()
 {
 const std::string value = GetInputBufferSnapshot();
 if (value.empty()) {
+// Empty Enter is intentionally a no-op: do not touch the clipboard and
+// do not show the transient "Copied" feedback.
 g_clipboardStatus.store(0);
-ClearInputBuffer();
-{
 std::lock_guard<std::mutex> lock(g_inputMutex);
-g_copiedFeedback = true;
-g_copiedFeedbackUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-}
+g_copiedFeedback = false;
 return;
 }
 
@@ -819,7 +816,7 @@ g_sceneId = scene;
         g_overlayManuallyDisabledForSession = false;
     } else if ((scene == 8 || scene == 9 || scene == 12) && oldScene <= 7) {
         if (!g_overlayManuallyDisabledForSession) {
-            g_overlayEnabled.store(true);
+            g_overlayEnabled.store(g_config.defaultVisible);
             RequestInfoRedraw();
         }
     }
@@ -1375,20 +1372,8 @@ RequestInputRedraw();
 
 int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
 {
-    // F10 remains polled here for low-latency game-frame edge detection.
-    // IP input is polled by the overlay thread and does not depend on this hook.
-
-    // Poll F10 on the game frame as well, so the key is not missed while the
-    // overlay thread is sleeping between its 35ms window-placement checks.
-    const bool f10Down = (GetAsyncKeyState(g_config.toggleKey) & 0x8000) != 0;
-    if (f10Down && !g_previousProcessF10Down) {
-        g_overlayEnabled.store(!g_overlayEnabled.load());
-        RequestInfoRedraw();
-    }
-    g_previousProcessF10Down = f10Down;
-
-    // F10 is polled asynchronously by the overlay thread so it also works while
-    // loading spectator matches, before BattleManager::onProcess is running.
+    // ToggleKey is polled only by OverlayThread. Having both this hook and the
+    // overlay thread toggle the same key caused a rapid double-toggle.
 if (g_originalBattleManagerOnProcess)
 return (self->*g_originalBattleManagerOnProcess)();
 return 0;
@@ -1490,15 +1475,17 @@ const auto now = Clock::now();
 
         // Async F10 polling: do not depend on BattleManager::onProcess, which may
         // not run during character-select or spectator loading. Ignore SceneID <= 7.
-        const bool f10Down = (GetAsyncKeyState(g_config.toggleKey) & 0x8000) != 0;
-        if (g_sceneId.load() > 7 && IsGameForeground() && f10Down && !g_previousAsyncF10Down) {
+        const bool toggleDown = g_config.toggleKey != 0 &&
+            (GetAsyncKeyState(static_cast<int>(g_config.toggleKey)) & 0x8000) != 0;
+        if (g_sceneId.load() > 7 && IsGameForeground() && toggleDown && !g_previousAsyncF10Down) {
             const bool enable = !g_overlayEnabled.load();
             g_overlayEnabled.store(enable);
             if (!enable)
                 g_overlayManuallyDisabledForSession = true;
+            UpdateInfoText();
             RequestInfoRedraw();
         }
-        g_previousAsyncF10Down = f10Down;
+        g_previousAsyncF10Down = toggleDown;
 
 if (now - g_lastWindowSearch >= std::chrono::milliseconds(35) || !g_gameWindow) {
 HWND found = FindGameWindow();
