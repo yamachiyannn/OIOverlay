@@ -296,8 +296,12 @@ bool IsWithinLastMonth(long long epochSeconds)
     if (thresholdTime == static_cast<std::time_t>(-1))
         return false;
 
-    return epochSeconds >= static_cast<long long>(thresholdTime) &&
-           epochSeconds <= static_cast<long long>(nowTime);
+    // OIViewer's original query applies only the lower bound:
+    // DateTime.Now.AddMonths(-1). It does not reject timestamps later than
+    // DateTime.Now. Default.db stores FILETIME values that may appear ahead
+    // of time(nullptr) before the display's -9-hour normalization, so an
+    // upper-bound check can incorrectly turn a player's month record into 0-0.
+    return epochSeconds >= static_cast<long long>(thresholdTime);
 }
 
 TskMatchRecord ReadRecord(
@@ -334,9 +338,35 @@ TskMatchRecord ReadRecord(
             record.hasParsedTimestamp = true;
 
         }
-        else if (originalTimestampType == SQLITE_INTEGER) {
+        else {
+            // 天則観のDBや変換済みDBでは、数値タイムスタンプが
+            // INTEGERではなくTEXTとして格納される場合もある。
+            // TEXTの場合も数字だけの値を数値タイムスタンプとして解析する。
+            long long value = 0;
+            bool numericTimestamp = (originalTimestampType == SQLITE_INTEGER);
 
-            long long value = originalTimestampValue;
+            if (numericTimestamp) {
+                value = originalTimestampValue;
+            }
+            else if (!record.timestampText.empty()) {
+                numericTimestamp = true;
+                for (unsigned char ch : record.timestampText) {
+                    if (ch < '0' || ch > '9') {
+                        numericTimestamp = false;
+                        break;
+                    }
+                }
+                if (numericTimestamp) {
+                    try {
+                        value = std::stoll(record.timestampText);
+                    }
+                    catch (...) {
+                        numericTimestamp = false;
+                    }
+                }
+            }
+
+            if (numericTimestamp) {
 
             /*
              * Unix seconds
@@ -436,6 +466,7 @@ TskMatchRecord ReadRecord(
 
                     record.hasParsedTimestamp = true;
                 }
+            }
             }
         }
     }
