@@ -28,7 +28,7 @@ v2では、iniファイルで各種設定が可能です...設定の手間は少
 
 ---
 
-####ダウンロードリンク
+#### ダウンロードリンク
 
 [v1](https://github.com/yamachiyannn/OIOverlay/releases/download/v1/OIOverlay_v1.zip) / [v2](https://github.com/yamachiyannn/OIOverlay/releases/download/v2/OIOverlay_v2.zip)
 
