@@ -18,8 +18,19 @@ th123OIViewerの機能を一部移植してSWRSToysのモジュールにした�
 
 
 
-現時点で、DBファイルが(th123.exeがあるディレクトリ)/th4_5888/Default.dbでないと戦績を読み込めません（IP手入力の機能などは使えます）
+v1では、DBファイルが(th123.exeがあるディレクトリ)/th4_5888/Default.dbでないと戦績を読み込めません
 
+
+
+v2では、iniファイルで各種設定が可能です...設定の手間は少しだけかかります
+
+
+
+---
+
+####ダウンロードリンク
+
+[v1](https://github.com/yamachiyannn/OIOverlay/releases/download/v1/OIOverlay_v1.zip) / [v2](https://github.com/yamachiyannn/OIOverlay/releases/download/v2/OIOverlay_v2.zip)
 
 
 ---
@@ -34,5 +45,5 @@ https://github.com/SokuDev/ModTemplate
 
 ---
 
-更新: 20261010
+更新: 20261011
 
