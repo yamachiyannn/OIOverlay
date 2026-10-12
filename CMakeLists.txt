@@ -61,6 +61,43 @@ add_subdirectory(SokuLib EXCLUDE_FROM_ALL)
 
 
 # ============================================================
+# Dear ImGui (DirectX 9 renderer only)
+#
+# The game itself owns the HWND and Direct3D 9 device. We use ImGui only to
+# build draw data and submit it from the game's EndScene hook; no ImGui-owned
+# overlay window or Win32 platform backend is created.
+# ============================================================
+
+include(FetchContent)
+
+FetchContent_Declare(
+    imgui_source
+    URL https://github.com/ocornut/imgui/archive/refs/tags/v1.90.9.tar.gz
+)
+
+FetchContent_GetProperties(imgui_source)
+if (NOT imgui_source_POPULATED)
+    FetchContent_Populate(imgui_source)
+endif ()
+
+add_library(imgui STATIC
+    "${imgui_source_SOURCE_DIR}/imgui.cpp"
+    "${imgui_source_SOURCE_DIR}/imgui_draw.cpp"
+    "${imgui_source_SOURCE_DIR}/imgui_tables.cpp"
+    "${imgui_source_SOURCE_DIR}/imgui_widgets.cpp"
+    "${imgui_source_SOURCE_DIR}/backends/imgui_impl_dx9.cpp"
+)
+
+target_include_directories(imgui PUBLIC
+    "${imgui_source_SOURCE_DIR}"
+    "${imgui_source_SOURCE_DIR}/backends"
+)
+
+target_compile_definitions(imgui PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+target_link_libraries(imgui PUBLIC d3d9)
+
+# ============================================================
 # SQLite
 #
 # Build time only:
@@ -147,6 +184,8 @@ add_library(
     "${PROJECT_NAME}"
     MODULE
     src/main.cpp
+    src/ImGuiRenderer.cpp
+    src/ImGuiRenderer.hpp
     src/TskDatabase.cpp
     src/TskDatabase.hpp
     src/OverlayConfig.cpp
@@ -194,6 +233,7 @@ target_link_directories(
 target_link_libraries(
     "${PROJECT_NAME}"
     sqlite3
+    imgui
     SokuLib
     shlwapi
     d3d9

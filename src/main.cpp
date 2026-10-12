@@ -2,8 +2,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-// The overlay is a transparent topmost window so it can also work on SceneID 2
-// and can show the TenSokuKan warning even while BattleManager is not active.
+// UI is drawn into Hisoutensoku's Direct3D 9 frame (no persistent overlay windows).
+// This also allows the SceneID 2 IP helper and TSK warning to be shown outside battle.
 // Default.db is opened READ ONLY. This module never writes to it.
 
 #include <Windows.h>
@@ -13,6 +13,8 @@
 #include "CombinedPlayersDatabase.hpp"
 #include "IpPortParser.hpp"
 #include "OverlayConfig.hpp"
+#include "ImGuiRenderer.hpp"
+#include "imgui.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,7 +26,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -37,15 +38,9 @@ constexpr uintptr_t kSceneIdAddress = 0x008A0044;
 constexpr uintptr_t kLeftProfileOffset = 0x04;
 constexpr uintptr_t kRightProfileOffset = 0x24;
 constexpr size_t kProfileSize = 0x20;
-constexpr wchar_t kWindowClassName[] = L"OIOverlayModuleLayerWindow";
-constexpr UINT kRefreshMessage = WM_APP + 9;
 
 HMODULE g_module = nullptr;
-HWND g_overlayWindow = nullptr; // opponent-information layer
-HWND g_inputWindow = nullptr;
-HWND g_warningWindow = nullptr;
 HWND g_gameWindow = nullptr;
-enum class OverlayLayer : LONG_PTR { Info = 1, Input = 2, Warning = 3 };
 HHOOK g_keyboardHook = nullptr;
 volatile LONG g_stopRequested = 0;
 std::atomic<int> g_sceneId{-1};
@@ -72,9 +67,8 @@ std::wstring g_inputLine;
 bool g_copiedFeedback = false;
 std::chrono::steady_clock::time_point g_copiedFeedbackUntil{};
 
-// Visible keyboard/clipboard diagnostics. Status values: -1 = not attempted,
-// 0 = empty input, 1 = success, 2 = failure. Atomics are shared by the
-// low-level keyboard callback and the overlay window thread.
+// Keyboard/clipboard diagnostics. Status values: -1 = not attempted,
+// 0 = empty input, 1 = success, 2 = failure.
 std::atomic<unsigned long long> g_inputHookEvents{0};
 std::atomic<DWORD> g_inputLastVirtualKey{0};
 std::atomic<unsigned long long> g_inputPollEvents{0};
@@ -94,17 +88,6 @@ bool g_watchP1StatsValid = false;
 bool g_watchP2StatsValid = false;
 std::uintmax_t g_dbSize = 0;
 FILETIME g_dbWriteTime{};
-RECT g_lastGameClientRect{};
-RECT g_lastGameWindowRect{};
-LONG_PTR g_lastGameWindowStyle = 0;
-LONG_PTR g_lastGameWindowExStyle = 0;
-HWND g_lastLocatedGameWindow = nullptr;
-bool g_haveLastGameClientRect = false;
-struct LayerBounds { int offsetX = 0; int offsetY = 0; int width = 0; int height = 0; bool valid = false; };
-LayerBounds g_infoLayerBounds;
-LayerBounds g_inputLayerBounds;
-LayerBounds g_warningLayerBounds;
-bool g_overlayWasVisible = false;
 
 using Clock = std::chrono::steady_clock;
 Clock::time_point g_lastTskCheck{};
@@ -113,16 +96,10 @@ Clock::time_point g_lastStatsRefresh{};
 Clock::time_point g_lastWarningBlink{};
 Clock::time_point g_lastCharacterRefresh{};
 Clock::time_point g_lastWindowSearch{};
-Clock::time_point g_lastGeometryCheck{};
 Clock::time_point g_lastKeyboardHookCheck{};
 
 static int (SokuLib::BattleManager::*g_originalBattleManagerOnProcess)() = nullptr;
 
-void RequestWindowRedraw(HWND window);
-void RequestInfoRedraw();
-void RequestInputRedraw();
-void RequestWarningRedraw();
-void RequestRedraw(); // all layers: startup, focus return or viewport geometry change
 void UpdateInputText();
 void UpdateInfoText();
 
@@ -679,10 +656,6 @@ DWORD pid = 0;
 GetWindowThreadProcessId(window, &pid);
 if (pid != GetCurrentProcessId() || !IsWindowVisible(window))
 return TRUE;
-wchar_t className[128]{};
-GetClassNameW(window, className, static_cast<int>(_countof(className)));
-if (wcscmp(className, kWindowClassName) == 0)
-return TRUE;
 if (GetWindow(window, GW_OWNER) != nullptr)
 return TRUE;
 RECT rect{};
@@ -817,7 +790,6 @@ g_sceneId = scene;
     } else if ((scene == 8 || scene == 9 || scene == 12) && oldScene <= 7) {
         if (!g_overlayManuallyDisabledForSession) {
             g_overlayEnabled.store(g_config.defaultVisible);
-            RequestInfoRedraw();
         }
     }
 
@@ -873,443 +845,234 @@ g_opponentProfile.clear();
 return true;
 }
 
-void RequestWindowRedraw(HWND window)
-{
-if (window && IsWindow(window))
-PostMessageW(window, kRefreshMessage, 0, 0);
-}
-
-void RequestInfoRedraw() { RequestWindowRedraw(g_overlayWindow); }
-void RequestInputRedraw() { RequestWindowRedraw(g_inputWindow); }
-void RequestWarningRedraw() { RequestWindowRedraw(g_warningWindow); }
-
-void RepositionVisibleLayer(HWND window, const LayerBounds& bounds)
-{
-if (!window || !bounds.valid || !IsWindowVisible(window) || !g_haveLastGameClientRect)
-return;
-SetWindowPos(window, nullptr,
-g_lastGameClientRect.left + bounds.offsetX,
-g_lastGameClientRect.top + bounds.offsetY,
-bounds.width, bounds.height,
-SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
-}
-
-void RaiseOverlayLayers()
-{
-// Keep each surface attached to the game's client area even when Alt+Enter
-// changes the display mode between content redraws.
-RepositionVisibleLayer(g_overlayWindow, g_infoLayerBounds);
-RepositionVisibleLayer(g_inputWindow, g_inputLayerBounds);
-RepositionVisibleLayer(g_warningWindow, g_warningLayerBounds);
-
-const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-if (g_overlayWindow && IsWindow(g_overlayWindow))
-SetWindowPos(g_overlayWindow, HWND_TOPMOST, 0, 0, 0, 0, flags);
-if (g_inputWindow && IsWindow(g_inputWindow))
-SetWindowPos(g_inputWindow, HWND_TOPMOST, 0, 0, 0, 0, flags);
-if (g_warningWindow && IsWindow(g_warningWindow))
-SetWindowPos(g_warningWindow, HWND_TOPMOST, 0, 0, 0, 0, flags);
-}
-
-void RequestRedraw()
-{
-RequestInfoRedraw();
-RequestInputRedraw();
-RequestWarningRedraw();
-}
-
 void UpdateInfoText()
 {
-std::vector<std::wstring> next;
-if (g_overlayEnabled) {
-if (IsNormalInfoScene(g_sceneId))
-SplitLines(BuildNormalInfo(), next);
-else if (g_sceneId == 12 || g_sceneId == 15)
-SplitLines(BuildWatchingInfo(), next);
-}
-if (next != g_infoLines)
-g_infoLines = std::move(next);
+    std::vector<std::wstring> next;
+    if (g_overlayEnabled) {
+        if (IsNormalInfoScene(g_sceneId))
+            SplitLines(BuildNormalInfo(), next);
+        else if (g_sceneId == 12 || g_sceneId == 15)
+            SplitLines(BuildWatchingInfo(), next);
+    }
+    if (next != g_infoLines)
+        g_infoLines = std::move(next);
 }
 
 void UpdateInputText()
 {
-std::wstring next;
-std::lock_guard<std::mutex> lock(g_inputMutex);
-if (g_copiedFeedback && std::chrono::steady_clock::now() >= g_copiedFeedbackUntil)
-g_copiedFeedback = false;
-if (g_inputEnabled && g_sceneId == 2) {
-if (g_copiedFeedback)
-next = L"IP:Port ＞ Copied";
-else
-next = L"IP:Port ＞ " + NarrowAsciiToWide(g_inputBuffer) + L"_";
-}
-if (next != g_inputLine) {
-g_inputLine = std::move(next);
-RequestInputRedraw();
-}
+    std::wstring next;
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    if (g_copiedFeedback && std::chrono::steady_clock::now() >= g_copiedFeedbackUntil)
+        g_copiedFeedback = false;
+    if (g_inputEnabled && g_sceneId == 2) {
+        if (g_copiedFeedback)
+            next = L"IP:Port ＞ Copied";
+        else
+            next = L"IP:Port ＞ " + NarrowAsciiToWide(g_inputBuffer) + L"_";
+    }
+    if (next != g_inputLine) {
+        g_inputLine = std::move(next);
+    }
 }
 
-void DrawTextLine(HDC dc, const std::wstring& line, int x, int y, int width, int height, COLORREF color, HFONT font,
-UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX)
+struct RenderSnapshot
 {
-SetTextColor(dc, color);
-HGDIOBJ oldFont = SelectObject(dc, font);
-RECT r{ x, y, x + width, y + height };
-DrawTextW(dc, line.c_str(), static_cast<int>(line.size()), &r, format);
-SelectObject(dc, oldFont);
-}
-
-struct AlphaFill {
-COLORREF color;
-BYTE alpha;
+    std::vector<std::wstring> infoLines;
+    std::wstring inputLine;
+    int sceneId = -1;
+    int warningState = 0;
+    bool overlayEnabled = true;
+    bool inputVisible = false;
+    bool warningBlink = false;
 };
 
-int ColorDistance(COLORREF a, COLORREF b)
+std::mutex g_renderSnapshotMutex;
+RenderSnapshot g_renderSnapshot;
+
+void PublishRenderSnapshot()
 {
-return abs(static_cast<int>(GetRValue(a)) - static_cast<int>(GetRValue(b))) +
-abs(static_cast<int>(GetGValue(a)) - static_cast<int>(GetGValue(b))) +
-abs(static_cast<int>(GetBValue(a)) - static_cast<int>(GetBValue(b)));
+    RenderSnapshot next;
+    next.infoLines = g_infoLines;
+    {
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        next.inputLine = g_inputLine;
+    }
+    next.sceneId = g_sceneId.load();
+    next.warningState = static_cast<int>(g_tskWarningState);
+    next.overlayEnabled = g_overlayEnabled.load();
+    next.inputVisible = g_inputEnabled.load() && next.sceneId == 2;
+    next.warningBlink = g_warningBlink;
+    std::lock_guard<std::mutex> lock(g_renderSnapshotMutex);
+    g_renderSnapshot = std::move(next);
 }
 
-void DrawPanel(HDC dc, const RECT& rect, COLORREF backgroundColor, COLORREF borderColor,
-std::vector<AlphaFill>& fills, BYTE backgroundAlpha)
+std::string WideToUtf8ForUi(const std::wstring& value)
 {
-HBRUSH background = CreateSolidBrush(backgroundColor);
-FillRect(dc, &rect, background);
-DeleteObject(background);
-HPEN pen = CreatePen(PS_SOLID, 1, borderColor);
-HGDIOBJ oldPen = SelectObject(dc, pen);
-HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
-Rectangle(dc, rect.left, rect.top, rect.right, rect.bottom);
-SelectObject(dc, oldBrush);
-SelectObject(dc, oldPen);
-DeleteObject(pen);
-for (const auto& fill : fills) {
-if (fill.color == backgroundColor)
-return;
-}
-fills.push_back({ backgroundColor, backgroundAlpha });
+    if (value.empty())
+        return {};
+    const int required = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (required <= 0)
+        return {};
+    std::string result(static_cast<size_t>(required), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+        &result[0], required, nullptr, nullptr) != required)
+        return {};
+    return result;
 }
 
-int TextPixelWidth(HDC dc, const std::wstring& text)
+struct UiTextLine
 {
-if (text.empty()) return 0;
-SIZE size{};
-if (!GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size)) return 0;
-return static_cast<int>(size.cx);
-}
+    std::string text;
+    ImU32 color;
+    float height;
+};
 
-std::vector<std::wstring> WrapLinesToWidth(HDC dc, const std::vector<std::wstring>& source, int maxWidth)
+void AddPanel(ImDrawList* draw, const ImVec2& min, const ImVec2& max,
+    ImU32 background, ImU32 border)
 {
-std::vector<std::wstring> output;
-for (const auto& line : source) {
-if (line.empty()) {
-output.emplace_back();
-continue;
-}
-size_t offset = 0;
-while (offset < line.size()) {
-const int remaining = static_cast<int>(line.size() - offset);
-int fit = 0;
-SIZE size{};
-if (!GetTextExtentExPointW(dc, line.c_str() + offset, remaining, maxWidth, &fit, nullptr, &size))
-fit = remaining;
-if (fit <= 0) fit = 1;
-output.emplace_back(line.substr(offset, static_cast<size_t>(fit)));
-offset += static_cast<size_t>(fit);
-}
-}
-return output;
+    draw->AddRectFilled(min, max, background, 4.0f);
+    draw->AddRect(min, max, border, 4.0f, 0, 1.0f);
 }
 
-void DrawAndRegisterPanel(HDC dc, const RECT& rect, COLORREF bg, BYTE alpha, COLORREF border,
-std::vector<AlphaFill>& fills)
+void DrawInfoPanel(ImDrawList* draw, int screenWidth, int screenHeight,
+    const std::vector<std::wstring>& sourceLines)
 {
-DrawPanel(dc, rect, bg, border, fills, alpha);
+    if (sourceLines.empty() || screenWidth <= 24 || screenHeight <= 24)
+        return;
+
+    const float fontSize = 12.0f;
+    const float lineBaseHeight = 14.0f;
+    const float maxPanelWidth = static_cast<float>((std::max)(120, (std::min)(screenWidth - 24, 620)));
+    const float maxTextWidth = (std::max)(60.0f, maxPanelWidth - 18.0f);
+    std::vector<UiTextLine> lines;
+    lines.reserve(sourceLines.size());
+    float widest = 0.0f;
+
+    ImFont* font = ImGui::GetFont();
+    for (size_t i = 0; i < sourceLines.size(); ++i) {
+        std::string line = WideToUtf8ForUi(sourceLines[i]);
+        const ImVec2 unwrapped = font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f,
+            line.c_str(), line.c_str() + line.size());
+        const ImVec2 wrapped = font->CalcTextSizeA(fontSize, maxTextWidth, maxTextWidth,
+            line.c_str(), line.c_str() + line.size());
+        widest = (std::max)(widest, (std::min)(unwrapped.x, maxTextWidth));
+        const float height = (std::max)(lineBaseHeight, wrapped.y);
+        lines.push_back({ std::move(line), i == 0 ? IM_COL32(185, 220, 255, 255) : IM_COL32(245, 245, 245, 255), height });
+    }
+
+    const float panelWidth = (std::min)(maxPanelWidth, (std::max)(150.0f, widest + 18.0f));
+    const float textWidth = (std::max)(40.0f, panelWidth - 16.0f);
+    float contentHeight = 0.0f;
+    for (auto& line : lines) {
+        const ImVec2 wrapped = font->CalcTextSizeA(fontSize, textWidth, textWidth,
+            line.text.c_str(), line.text.c_str() + line.text.size());
+        line.height = (std::max)(lineBaseHeight, wrapped.y);
+        contentHeight += line.height;
+    }
+    const float panelHeight = contentHeight + 12.0f;
+    const float left = 12.0f;
+    const float top = (std::max)(8.0f, (static_cast<float>(screenHeight) - panelHeight) / 2.0f);
+
+    // The near-black fill at alpha 165/255 looked too opaque in-game.
+    // Lower alpha leaves more of the match visible while retaining readable text.
+    AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
+        IM_COL32(8, 8, 12, 100), IM_COL32(90, 115, 145, 155));
+
+    float y = top + 5.0f;
+    for (const auto& line : lines) {
+        if (!line.text.empty())
+            draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, y), line.color,
+                line.text.c_str(), line.text.c_str() + line.text.size(), textWidth);
+        y += line.height;
+    }
 }
 
-void ApplyPerPixelAlpha(DWORD* pixels, int width, int height, const std::vector<AlphaFill>& fills)
+void DrawInputPanel(ImDrawList* draw, int screenWidth, int screenHeight, const std::wstring& inputLine)
 {
-const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
-for (size_t i = 0; i < count; ++i) {
-const COLORREF color = static_cast<COLORREF>(pixels[i] & 0x00ffffffu);
-if (color == RGB(0, 0, 0)) {
-pixels[i] = 0;
-continue;
-}
-const AlphaFill* best = nullptr;
-int bestDistance = 100000;
-for (const auto& fill : fills) {
-const int distance = ColorDistance(color, fill.color);
-if (distance < bestDistance) { bestDistance = distance; best = &fill; }
-}
-BYTE alpha = (best && bestDistance <= 24) ? best->alpha : 255;
-const BYTE r = GetRValue(color), g = GetGValue(color), b = GetBValue(color);
-const BYTE pr = static_cast<BYTE>((static_cast<unsigned>(r) * alpha + 127) / 255);
-const BYTE pg = static_cast<BYTE>((static_cast<unsigned>(g) * alpha + 127) / 255);
-const BYTE pb = static_cast<BYTE>((static_cast<unsigned>(b) * alpha + 127) / 255);
-pixels[i] = (static_cast<DWORD>(alpha) << 24) | (static_cast<DWORD>(pr) << 16) |
-(static_cast<DWORD>(pg) << 8) | static_cast<DWORD>(pb);
-}
+    if (screenWidth <= 24 || screenHeight <= 24 || inputLine.empty())
+        return;
+
+    const std::string inputUtf8 = WideToUtf8ForUi(inputLine);
+    const std::string help = "1~9 / . / : / BS / Enter / Ctrl+V";
+    // The atlas font is baked at 16 px. Drawing it at 12 px resamples the glyphs
+    // and makes this small UI look softer and smaller than the old OIOv2 panel.
+    // Draw at the baked size so the glyphs stay crisp, and give the second line
+    // enough vertical room.
+    const float fontSize = 16.0f;
+    const float maxPanelWidth = static_cast<float>((std::max)(120, (std::min)(screenWidth - 24, 520)));
+    ImFont* font = ImGui::GetFont();
+    const float measured = (std::max)(
+        font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f, inputUtf8.c_str(), inputUtf8.c_str() + inputUtf8.size()).x,
+        font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f, help.c_str(), help.c_str() + help.size()).x);
+    const float panelWidth = (std::min)(maxPanelWidth, (std::max)(220.0f, measured + 20.0f));
+    const float panelHeight = 54.0f;
+    const float left = 12.0f;
+    const float top = (std::max)(8.0f, static_cast<float>(screenHeight) - panelHeight - 14.0f);
+
+    AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
+        IM_COL32(10, 10, 10, 175), IM_COL32(90, 145, 110, 200));
+    draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, top + 4.0f),
+        IM_COL32(255, 255, 255, 255), inputUtf8.c_str());
+    draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, top + 29.0f),
+        IM_COL32(190, 220, 200, 255), help.c_str());
 }
 
-using LayerPainter = void(*)(HDC, std::vector<AlphaFill>&);
-
-void RenderLayerSurface(HWND window, int x, int y, int width, int height,
-const std::function<void(HDC, std::vector<AlphaFill>&)>& draw)
+void DrawWarningPanel(ImDrawList* draw, int screenWidth, int screenHeight, int warningState, bool blink)
 {
-if (!window || width <= 0 || height <= 0)
-return;
-HDC screenDc = GetDC(nullptr);
-if (!screenDc)
-return;
-BITMAPINFO info{};
-info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-info.bmiHeader.biWidth = width;
-info.bmiHeader.biHeight = -height;
-info.bmiHeader.biPlanes = 1;
-info.bmiHeader.biBitCount = 32;
-info.bmiHeader.biCompression = BI_RGB;
-void* rawPixels = nullptr;
-HBITMAP dib = CreateDIBSection(screenDc, &info, DIB_RGB_COLORS, &rawPixels, nullptr, 0);
-HDC dc = CreateCompatibleDC(screenDc);
-if (!dib || !dc || !rawPixels) {
-if (dib) DeleteObject(dib);
-if (dc) DeleteDC(dc);
-ReleaseDC(nullptr, screenDc);
-return;
-}
-HGDIOBJ oldBitmap = SelectObject(dc, dib);
-std::memset(rawPixels, 0, static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
-SetBkMode(dc, TRANSPARENT);
-std::vector<AlphaFill> fills;
-draw(dc, fills);
-ApplyPerPixelAlpha(static_cast<DWORD*>(rawPixels), width, height, fills);
+    if (warningState == 0 || screenWidth <= 32 || screenHeight <= 32)
+        return;
 
-POINT destination{ x, y };
-POINT source{ 0, 0 };
-SIZE size{ width, height };
-BLENDFUNCTION blend{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-if (UpdateLayeredWindow(window, screenDc, &destination, &size, dc, &source, 0, &blend, ULW_ALPHA)) {
-LayerBounds* savedBounds = nullptr;
-if (window == g_overlayWindow) savedBounds = &g_infoLayerBounds;
-else if (window == g_inputWindow) savedBounds = &g_inputLayerBounds;
-else if (window == g_warningWindow) savedBounds = &g_warningLayerBounds;
-if (savedBounds && g_haveLastGameClientRect) {
-savedBounds->offsetX = x - g_lastGameClientRect.left;
-savedBounds->offsetY = y - g_lastGameClientRect.top;
-savedBounds->width = width;
-savedBounds->height = height;
-savedBounds->valid = true;
-}
-if (!IsWindowVisible(window))
-ShowWindow(window, SW_SHOWNOACTIVATE);
-// Alt+Enter / fullscreen transitions can disturb the Z-order of
-// non-activating layered windows. Reassert this layer's topmost status
-// whenever it is redrawn; if the warning is active, put it back on top.
-SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
-SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-if (window != g_warningWindow && g_warningWindow && IsWindowVisible(g_warningWindow) &&
-g_tskWarningState != TskWarningState::None) {
-SetWindowPos(g_warningWindow, HWND_TOPMOST, 0, 0, 0, 0,
-SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-}
+    const bool notRunning = warningState == static_cast<int>(TskWarningState::NotRunning);
+    const std::string title = notRunning
+        ? WideToUtf8ForUi(L"天則観（tsk.exe）が起動していません！")
+        : WideToUtf8ForUi(L"天則観が非想天則を検知していません");
+    const std::string subtitle = notRunning
+        ? WideToUtf8ForUi(L"天則観を起動してから対戦してください")
+        : WideToUtf8ForUi(L"非想天則を再起動してください");
+    const ImU32 flash = blink ? IM_COL32(255, 55, 55, 255) : IM_COL32(255, 210, 40, 255);
+    const float titleSize = 22.0f;
+    const float subtitleSize = 16.0f;
+    const float textWidth = (std::max)(160.0f, static_cast<float>(screenWidth) - 44.0f);
+    const ImVec2 titleExtent = ImGui::GetFont()->CalcTextSizeA(titleSize, textWidth, textWidth,
+        title.c_str(), title.c_str() + title.size());
+    const ImVec2 subtitleExtent = ImGui::GetFont()->CalcTextSizeA(subtitleSize, textWidth, textWidth,
+        subtitle.c_str(), subtitle.c_str() + subtitle.size());
+    const float panelWidth = (std::min)(static_cast<float>(screenWidth - 20),
+        (std::max)(320.0f, (std::max)(titleExtent.x, subtitleExtent.x) + 36.0f));
+    const float panelHeight = 102.0f;
+    const float left = (std::max)(10.0f, (static_cast<float>(screenWidth) - panelWidth) / 2.0f);
+    const float top = (std::max)(10.0f, (static_cast<float>(screenHeight) - panelHeight) / 2.0f);
+    const ImU32 background = notRunning ? IM_COL32(12, 12, 18, 255) : IM_COL32(14, 14, 22, 145);
+
+    AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight), background, flash);
+    draw->AddText(ImGui::GetFont(), titleSize, ImVec2(left + 12.0f, top + 15.0f), flash,
+        title.c_str(), title.c_str() + title.size(), panelWidth - 24.0f);
+    draw->AddText(ImGui::GetFont(), subtitleSize, ImVec2(left + 12.0f, top + 59.0f),
+        IM_COL32(255, 255, 255, 255), subtitle.c_str(), subtitle.c_str() + subtitle.size(), panelWidth - 24.0f);
 }
 
-SelectObject(dc, oldBitmap);
-DeleteObject(dib);
-DeleteDC(dc);
-ReleaseDC(nullptr, screenDc);
-}
-
-void PaintInfoLayer(HWND window)
+void RenderGameUi(int screenWidth, int screenHeight)
 {
-// WM_PAINT can occur independently of our posted refresh message. Rebuild
-// the same info text used by both normal and spectator views here as well,
-// so entering SceneID 8-11 cannot leave the info layer with stale/empty lines.
-UpdateInfoText();
-const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
-const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
-if (!g_haveLastGameClientRect || !g_overlayEnabled || g_infoLines.empty() || gameWidth <= 0 || gameHeight <= 0) {
-ShowWindow(window, SW_HIDE);
-return;
-}
+    // This callback runs on the game render thread. The snapshot is produced by
+    // OverlayThread; avoid reading its non-atomic HWND there. The UI is drawn only
+    // into the game's own swap chain, so it cannot become a desktop overlay.
+    RenderSnapshot snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_renderSnapshotMutex);
+        snapshot = g_renderSnapshot;
+    }
 
-HDC measureDc = GetDC(nullptr);
-if (!measureDc) return;
-HFONT font = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-HGDIOBJ oldFont = SelectObject(measureDc, font);
-const int maxPanelWidth = (std::max)(120, (std::min)(gameWidth - 24, 620));
-const auto lines = WrapLinesToWidth(measureDc, g_infoLines, (std::max)(50, maxPanelWidth - 18));
-int widest = 0;
-for (const auto& line : lines) widest = (std::max)(widest, TextPixelWidth(measureDc, line));
-const int panelWidth = (std::min)(maxPanelWidth, (std::max)(150, widest + 18));
-int lineHeight = 14;
-const int availableHeight = (std::max)(40, gameHeight - 16);
-if (!lines.empty() && static_cast<int>(lines.size()) * lineHeight + 12 > availableHeight)
-lineHeight = (std::max)(9, (availableHeight - 12) / static_cast<int>(lines.size()));
-SelectObject(measureDc, oldFont);
-DeleteObject(font);
-ReleaseDC(nullptr, measureDc);
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    if (!draw)
+        return;
 
-int fontHeight = lineHeight < 14 ? (std::max)(8, lineHeight - 2) : 12;
-const int panelHeight = static_cast<int>(lines.size()) * lineHeight + 12;
-// Center the information window vertically rather than keeping it near the top third.
-int top = (std::max)(22, (gameHeight - panelHeight) / 2);
-if (top + panelHeight > gameHeight - 8) top = (std::max)(8, gameHeight - panelHeight - 8);
-const int left = 12;
-const COLORREF background = RGB(8, 8, 12);
-RenderLayerSurface(window, g_lastGameClientRect.left + left, g_lastGameClientRect.top + top,
-panelWidth, panelHeight, [=](HDC dc, std::vector<AlphaFill>& fills) {
-HFONT drawFont = CreateFontW(fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-RECT panel{ 0, 0, panelWidth, panelHeight };
-DrawAndRegisterPanel(dc, panel, background, 165, RGB(90, 115, 145), fills);
-for (size_t i = 0; i < lines.size(); ++i) {
-const COLORREF color = i == 0 ? RGB(185, 220, 255) : RGB(245, 245, 245);
-DrawTextLine(dc, lines[i], 8, 5 + static_cast<int>(i) * lineHeight,
-panelWidth - 16, lineHeight, color, drawFont);
-}
-DeleteObject(drawFont);
-});
-}
-
-void PaintInputLayer(HWND window)
-{
-const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
-const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
-if (!g_haveLastGameClientRect || !g_inputEnabled || g_sceneId != 2 || gameWidth <= 0 || gameHeight <= 0) {
-ShowWindow(window, SW_HIDE);
-return;
-}
-
-std::wstring inputLine;
-size_t inputLength = 0;
-{
-std::lock_guard<std::mutex> lock(g_inputMutex);
-inputLine = g_inputLine;
-inputLength = g_inputBuffer.size();
-}
-
-const std::wstring help = L"1~9 / . / : / BS / Enter / Ctrl+V";
-const COLORREF background = RGB(10, 10, 10);
-HDC measureDc = GetDC(nullptr);
-if (!measureDc) return;
-HFONT font = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-HGDIOBJ oldFont = SelectObject(measureDc, font);
-const int maxPanelWidth = (std::max)(120, (std::min)(gameWidth - 24, 520));
-int requestedWidth = TextPixelWidth(measureDc, inputLine);
-requestedWidth = (std::max)(requestedWidth, TextPixelWidth(measureDc, help));
-
-const int panelWidth = (std::min)(maxPanelWidth, (std::max)(190, requestedWidth + 18));
-SelectObject(measureDc, oldFont);
-DeleteObject(font);
-ReleaseDC(nullptr, measureDc);
-
-const int panelHeight = 42;
-const int left = 12;
-const int top = (std::max)(8, gameHeight - panelHeight - 14);
-RenderLayerSurface(window, g_lastGameClientRect.left + left, g_lastGameClientRect.top + top,
-panelWidth, panelHeight, [=](HDC dc, std::vector<AlphaFill>& fills) {
-HFONT drawFont = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-RECT panel{ 0, 0, panelWidth, panelHeight };
-DrawAndRegisterPanel(dc, panel, background, 190, RGB(90, 145, 110), fills);
-DrawTextLine(dc, inputLine, 8, 2, panelWidth - 16, 18, RGB(255, 255, 255), drawFont);
-DrawTextLine(dc, help, 8, 20, panelWidth - 16, 18, RGB(190, 220, 200), drawFont);
-DeleteObject(drawFont);
-});
-}
-
-void PaintWarningLayer(HWND window)
-{
-const int gameWidth = static_cast<int>(g_lastGameClientRect.right - g_lastGameClientRect.left);
-const int gameHeight = static_cast<int>(g_lastGameClientRect.bottom - g_lastGameClientRect.top);
-if (!g_haveLastGameClientRect || g_tskWarningState == TskWarningState::None || gameWidth <= 0 || gameHeight <= 0) {
-ShowWindow(window, SW_HIDE);
-return;
-}
-
-const bool notRunning = g_tskWarningState == TskWarningState::NotRunning;
-const std::wstring title = notRunning ? L"天則観（tsk.exe）が起動していません！" : L"天則観が非想天則を検知していません";
-const std::wstring subtitle = notRunning ? L"天則観を起動してから対戦してください" : L"非想天則を再起動してください";
-const COLORREF flash = g_warningBlink ? RGB(255, 55, 55) : RGB(255, 210, 40);
-HDC measureDc = GetDC(nullptr);
-if (!measureDc) return;
-HFONT titleFont = CreateFontW(26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-HFONT subtitleFont = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-HGDIOBJ oldFont = SelectObject(measureDc, titleFont);
-const int titleWidth = TextPixelWidth(measureDc, title);
-SelectObject(measureDc, subtitleFont);
-const int subtitleWidth = TextPixelWidth(measureDc, subtitle);
-SelectObject(measureDc, oldFont);
-DeleteObject(subtitleFont);
-DeleteObject(titleFont);
-ReleaseDC(nullptr, measureDc);
-
-const int boxWidth = (std::min)(gameWidth - 20, (std::max)(320, (std::max)(titleWidth, subtitleWidth) + 36));
-const int boxHeight = 102;
-const int left = (std::max)(10, (gameWidth - boxWidth) / 2);
-const int top = (std::max)(10, (gameHeight - boxHeight) / 2);
-const COLORREF warningBackground = notRunning ? RGB(12, 12, 18) : RGB(14, 14, 22);
-const BYTE warningAlpha = notRunning ? 255 : 145;
-RenderLayerSurface(window, g_lastGameClientRect.left + left, g_lastGameClientRect.top + top,
-boxWidth, boxHeight, [=](HDC dc, std::vector<AlphaFill>& fills) {
-HFONT tf = CreateFontW(26, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-HFONT sf = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, SHIFTJIS_CHARSET,
-OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
-RECT panel{ 0, 0, boxWidth, boxHeight };
-DrawAndRegisterPanel(dc, panel, warningBackground, warningAlpha, flash, fills);
-DrawTextLine(dc, title, 12, 12, boxWidth - 24, 38, flash, tf,
-DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-DrawTextLine(dc, subtitle, 12, 56, boxWidth - 24, 28, RGB(255, 255, 255), sf,
-DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-DeleteObject(sf);
-DeleteObject(tf);
-});
-}
-
-void PaintOverlay(HWND window)
-{
-if (window == g_overlayWindow) PaintInfoLayer(window);
-else if (window == g_inputWindow) PaintInputLayer(window);
-else if (window == g_warningWindow) PaintWarningLayer(window);
-}
-
-LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
-{
-switch (message) {
-case WM_PAINT: {
-PAINTSTRUCT ps{};
-BeginPaint(window, &ps);
-EndPaint(window, &ps);
-PaintOverlay(window);
-return 0;
-}
-case WM_ERASEBKGND:
-return 1;
-case kRefreshMessage:
-if (window == g_inputWindow)
-UpdateInputText();
-else if (window == g_overlayWindow)
-UpdateInfoText();
-PaintOverlay(window);
-return 0;
-case WM_NCHITTEST:
-return HTTRANSPARENT;
-case WM_MOUSEACTIVATE:
-return MA_NOACTIVATE;
-case WM_CLOSE:
-ShowWindow(window, SW_HIDE);
-return 0;
-default:
-return DefWindowProcW(window, message, wParam, lParam);
-}
+    // Render in this order so the TSK warning remains visible above the other panels.
+    if (snapshot.overlayEnabled)
+        DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.infoLines);
+    if (snapshot.inputVisible)
+        DrawInputPanel(draw, screenWidth, screenHeight, snapshot.inputLine);
+    DrawWarningPanel(draw, screenWidth, screenHeight, snapshot.warningState, snapshot.warningBlink);
 }
 
 void PollIpInputFromGameFrame()
@@ -1365,15 +1128,14 @@ handled = true;
 
 if (handled) {
 UpdateInputText();
-RequestInputRedraw();
 }
 }
 }
 
 int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
 {
-    // ToggleKey is polled only by OverlayThread. Having both this hook and the
-    // overlay thread toggle the same key caused a rapid double-toggle.
+    // ToggleKey is polled only by OverlayThread. Keep this compatibility hook
+    // pass-through to preserve the existing module setup.
 if (g_originalBattleManagerOnProcess)
 return (self->*g_originalBattleManagerOnProcess)();
 return 0;
@@ -1418,63 +1180,29 @@ return true;
 
 DWORD WINAPI OverlayThread(void*)
 {
-WNDCLASSEXW wc{};
-wc.cbSize = sizeof(wc);
-wc.hInstance = g_module ? g_module : GetModuleHandleW(nullptr);
-wc.lpfnWndProc = OverlayWndProc;
-wc.lpszClassName = kWindowClassName;
-wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
-wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-RegisterClassExW(&wc);
+    // The keyboard hook is diagnostic only; key polling remains active independently
+    // of BattleManager so the SceneID 2 IP helper works on the title/menu screen.
+    InstallKeyboardHook();
+    g_lastKeyboardHookCheck = Clock::now();
+    g_databasePath = FindDefaultDatabase();
+    if (!g_databasePath.empty())
+        g_database = std::make_unique<TskDatabase>(g_databasePath);
 
-const DWORD style = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
-auto createLayer = [&](OverlayLayer layer) -> HWND {
-HWND window = CreateWindowExW(style, kWindowClassName, L"OIOverlay", WS_POPUP,
-0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
-if (window)
-SetWindowLongPtrW(window, GWLP_USERDATA, static_cast<LONG_PTR>(layer));
-return window;
-};
-g_overlayWindow = createLayer(OverlayLayer::Info);
-g_inputWindow = createLayer(OverlayLayer::Input);
-g_warningWindow = createLayer(OverlayLayer::Warning);
-if (!g_overlayWindow || !g_inputWindow || !g_warningWindow) {
-if (g_overlayWindow) DestroyWindow(g_overlayWindow);
-if (g_inputWindow) DestroyWindow(g_inputWindow);
-if (g_warningWindow) DestroyWindow(g_warningWindow);
-g_overlayWindow = g_inputWindow = g_warningWindow = nullptr;
-UnregisterClassW(kWindowClassName, wc.hInstance);
-return 1;
-}
+    g_tskRunning = IsTskRunning();
+    g_tskWarningState = g_tskRunning ? TskWarningState::None : TskWarningState::NotRunning;
+    g_lastTskCheck = Clock::now();
+    g_lastDbCheck = Clock::now();
+    g_lastWarningBlink = Clock::now();
+    g_lastCharacterRefresh = Clock::now();
+    g_lastWindowSearch = Clock::time_point{};
 
-// Per-pixel transparency is applied by UpdateLayeredWindow, not SetLayeredWindowAttributes.
-// The low-level hook is diagnostic only; input is polled from the game's frame hook.
-InstallKeyboardHook();
-g_lastKeyboardHookCheck = Clock::now();
-g_databasePath = FindDefaultDatabase();
-if (!g_databasePath.empty())
-g_database = std::make_unique<TskDatabase>(g_databasePath);
+    PublishRenderSnapshot();
 
-g_tskRunning = IsTskRunning();
-g_tskWarningState = g_tskRunning ? TskWarningState::None : TskWarningState::NotRunning;
-g_lastTskCheck = Clock::now();
-g_lastDbCheck = Clock::now();
-g_lastWarningBlink = Clock::now();
-g_lastCharacterRefresh = Clock::now();
-g_lastWindowSearch = Clock::time_point{};
-g_lastGeometryCheck = Clock::time_point{};
-RequestRedraw();
+    while (InterlockedCompareExchange(&g_stopRequested, 0, 0) == 0) {
+        const auto now = Clock::now();
 
-while (InterlockedCompareExchange(&g_stopRequested, 0, 0) == 0) {
-MSG message{};
-while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-TranslateMessage(&message);
-DispatchMessageW(&message);
-}
-const auto now = Clock::now();
-
-        // Async F10 polling: do not depend on BattleManager::onProcess, which may
-        // not run during character-select or spectator loading. Ignore SceneID <= 7.
+        // Toggle key is polled outside the BattleManager hook so character-select
+        // and spectator-loading scenes keep responding. SceneID <= 7 re-arms default.
         const bool toggleDown = g_config.toggleKey != 0 &&
             (GetAsyncKeyState(static_cast<int>(g_config.toggleKey)) & 0x8000) != 0;
         if (g_sceneId.load() > 7 && IsGameForeground() && toggleDown && !g_previousAsyncF10Down) {
@@ -1483,147 +1211,98 @@ const auto now = Clock::now();
             if (!enable)
                 g_overlayManuallyDisabledForSession = true;
             UpdateInfoText();
-            RequestInfoRedraw();
         }
         g_previousAsyncF10Down = toggleDown;
 
-if (now - g_lastWindowSearch >= std::chrono::milliseconds(35) || !g_gameWindow) {
-HWND found = FindGameWindow();
-if (found != g_gameWindow) {
-g_gameWindow = found;
-g_haveLastGameClientRect = false;
-}
-g_lastWindowSearch = now;
-}
+        if (now - g_lastWindowSearch >= std::chrono::milliseconds(250) || !g_gameWindow) {
+            HWND found = FindGameWindow();
+            if (found != g_gameWindow) {
+                g_gameWindow = found;
+                OIOverlayImGui::SetTargetWindow(found);
+            }
+            g_lastWindowSearch = now;
+        }
 
-const bool canShow = g_gameWindow && !IsIconic(g_gameWindow) && IsGameForeground();
-if (!canShow) {
-if (g_overlayWasVisible) {
-ShowWindow(g_overlayWindow, SW_HIDE);
-ShowWindow(g_inputWindow, SW_HIDE);
-ShowWindow(g_warningWindow, SW_HIDE);
-g_overlayWasVisible = false;
-}
-Sleep(35);
-continue;
-}
-if (!g_overlayWasVisible) {
-g_overlayWasVisible = true;
-RequestRedraw();
-}
+        // DirectX hooking is deliberately NOT attempted from this worker thread.
+        // It is installed by the game-setup call hook after Soku's own D3D9
+        // initialization has returned (see InstallBootstrap in ImGuiRenderer.cpp).
 
-if (now - g_lastGeometryCheck >= std::chrono::milliseconds(35)) {
-RECT client{};
-RECT windowRect{};
-if (GetClientRect(g_gameWindow, &client) && GetWindowRect(g_gameWindow, &windowRect)) {
-POINT origin{ client.left, client.top };
-ClientToScreen(g_gameWindow, &origin);
-const int w = static_cast<int>((std::max)(static_cast<LONG>(1), static_cast<LONG>(client.right - client.left)));
-const int h = static_cast<int>((std::max)(static_cast<LONG>(1), static_cast<LONG>(client.bottom - client.top)));
-const LONG_PTR windowStyle = GetWindowLongPtrW(g_gameWindow, GWL_STYLE);
-const LONG_PTR windowExStyle = GetWindowLongPtrW(g_gameWindow, GWL_EXSTYLE);
-const bool changed = !g_haveLastGameClientRect || g_lastLocatedGameWindow != g_gameWindow ||
-g_lastGameClientRect.left != origin.x || g_lastGameClientRect.top != origin.y ||
-g_lastGameClientRect.right != origin.x + w || g_lastGameClientRect.bottom != origin.y + h ||
-g_lastGameWindowRect.left != windowRect.left || g_lastGameWindowRect.top != windowRect.top ||
-g_lastGameWindowRect.right != windowRect.right || g_lastGameWindowRect.bottom != windowRect.bottom ||
-g_lastGameWindowStyle != windowStyle || g_lastGameWindowExStyle != windowExStyle;
-if (changed) {
-g_lastGameClientRect = RECT{ origin.x, origin.y, origin.x + w, origin.y + h };
-g_lastGameWindowRect = windowRect;
-g_lastGameWindowStyle = windowStyle;
-g_lastGameWindowExStyle = windowExStyle;
-g_lastLocatedGameWindow = g_gameWindow;
-g_haveLastGameClientRect = true;
-// A mode/style/position change is a real viewport event; re-render each independent layer.
-RequestRedraw();
-}
-}
-// Match the earlier working overlay's fast placement cadence. The three
-// layers stay independent; only their Z-order is touched on stable frames.
-RaiseOverlayLayers();
-g_lastGeometryCheck = now;
-}
+        const bool canShow = g_gameWindow && !IsIconic(g_gameWindow) && IsGameForeground();
+        if (!canShow) {
+            PublishRenderSnapshot();
+            Sleep(35);
+            continue;
+        }
 
-if (now - g_lastKeyboardHookCheck >= std::chrono::seconds(2)) {
-if (!g_keyboardHook && InstallKeyboardHook())
-RequestInputRedraw();
-g_lastKeyboardHookCheck = now;
-}
+        if (now - g_lastKeyboardHookCheck >= std::chrono::seconds(2)) {
+            if (!g_keyboardHook)
+                InstallKeyboardHook();
+            g_lastKeyboardHookCheck = now;
+        }
 
-if (now - g_lastTskCheck >= std::chrono::milliseconds(300)) {
-const bool nowRunning = IsTskRunning();
-if (nowRunning != g_tskRunning) {
-const bool wasRunning = g_tskRunning;
-g_tskRunning = nowRunning;
-g_tskWarningState = !nowRunning ? TskWarningState::NotRunning
-: (wasRunning ? TskWarningState::None : TskWarningState::GameNotDetected);
-g_warningBlink = false;
-g_lastWarningBlink = now;
-RequestWarningRedraw();
-}
-g_lastTskCheck = now;
-}
+        if (now - g_lastTskCheck >= std::chrono::milliseconds(300)) {
+            const bool nowRunning = IsTskRunning();
+            if (nowRunning != g_tskRunning) {
+                const bool wasRunning = g_tskRunning;
+                g_tskRunning = nowRunning;
+                g_tskWarningState = !nowRunning ? TskWarningState::NotRunning
+                    : (wasRunning ? TskWarningState::None : TskWarningState::GameNotDetected);
+                g_warningBlink = false;
+                g_lastWarningBlink = now;
+                }
+            g_lastTskCheck = now;
+        }
 
-const bool sceneChanged = UpdateSceneState();
-if (sceneChanged) {
-if (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15)
-RefreshStats(true);
-UpdateInfoText();
-UpdateInputText();
-RequestInfoRedraw();
-RequestInputRedraw();
-g_lastCharacterRefresh = now;
-}
+        const bool sceneChanged = UpdateSceneState();
+        if (sceneChanged) {
+            if (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15)
+                RefreshStats(true);
+            UpdateInfoText();
+            UpdateInputText();
+            g_lastCharacterRefresh = now;
+        }
 
-// Poll IP input independently of BattleManager::onProcess so it works
-// on SceneID 2 even when the game is at the title/menu screen.
-PollIpInputFromGameFrame();
-UpdateInputText();
+        // Keep existing IP parsing/copy/paste behavior, including the Alt+Enter guard.
+        PollIpInputFromGameFrame();
+        UpdateInputText();
 
-// Only the information layer refreshes once per second in character-select.
-// Spectator records are re-read only on SceneID transitions.
-if (g_overlayEnabled && IsNormalInfoScene(g_sceneId) &&
-(g_infoLines.empty() || now - g_lastCharacterRefresh >= std::chrono::seconds(1))) {
-const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
-const std::string opponent = ReadProfile(offset);
-if (!opponent.empty() && opponent != g_opponentProfile) {
-g_opponentProfile = opponent;
-g_normalStats = {};
-g_normalStatsValid = false;
-g_cachedNormalProfile.clear();
-}
-RefreshStats(true);
-UpdateInfoText();
-RequestInfoRedraw();
-g_lastCharacterRefresh = now;
-}
+        if (g_overlayEnabled && IsNormalInfoScene(g_sceneId) &&
+            (g_infoLines.empty() || now - g_lastCharacterRefresh >= std::chrono::seconds(1))) {
+            const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
+            const std::string opponent = ReadProfile(offset);
+            if (!opponent.empty() && opponent != g_opponentProfile) {
+                g_opponentProfile = opponent;
+                g_normalStats = {};
+                g_normalStatsValid = false;
+                g_cachedNormalProfile.clear();
+            }
+            RefreshStats(true);
+            UpdateInfoText();
+            g_lastCharacterRefresh = now;
+        }
 
-if (now - g_lastDbCheck >= std::chrono::milliseconds(500)) {
-RefreshDatabase();
-(void)DatabaseChanged();
-g_lastDbCheck = now;
-}
+        if (now - g_lastDbCheck >= std::chrono::milliseconds(500)) {
+            RefreshDatabase();
+            (void)DatabaseChanged();
+            g_lastDbCheck = now;
+        }
 
-if (g_tskWarningState != TskWarningState::None &&
-now - g_lastWarningBlink >= std::chrono::milliseconds(500)) {
-g_warningBlink = !g_warningBlink;
-g_lastWarningBlink = now;
-RequestWarningRedraw();
-}
-Sleep(8);
-}
+        if (g_tskWarningState != TskWarningState::None &&
+            now - g_lastWarningBlink >= std::chrono::milliseconds(500)) {
+            g_warningBlink = !g_warningBlink;
+            g_lastWarningBlink = now;
+        }
 
-if (g_keyboardHook) {
-UnhookWindowsHookEx(g_keyboardHook);
-g_keyboardHook = nullptr;
-}
-if (g_overlayWindow) DestroyWindow(g_overlayWindow);
-if (g_inputWindow) DestroyWindow(g_inputWindow);
-if (g_warningWindow) DestroyWindow(g_warningWindow);
-g_overlayWindow = g_inputWindow = g_warningWindow = nullptr;
-UnregisterClassW(kWindowClassName, wc.hInstance);
-return 0;
+        PublishRenderSnapshot();
+        Sleep(8);
+    }
+
+    if (g_keyboardHook) {
+        UnhookWindowsHookEx(g_keyboardHook);
+        g_keyboardHook = nullptr;
+    }
+    OIOverlayImGui::Shutdown();
+    return 0;
 }
 
 } // namespace
@@ -1642,6 +1321,11 @@ if (!g_config.playersDbPath.empty())
 g_playersDatabase = std::make_unique<CombinedPlayersDatabase>(g_config.playersDbPath);
 if (!InstallBattleManagerProcessHook())
 return false;
+// The bootstrap only patches a verified x86 CALL site. Actual D3D9 device
+// hooking happens after the game's original setup routine has returned.
+if (!OIOverlayImGui::InstallBootstrap(RenderGameUi)) {
+    OutputDebugStringW(L"[OIOverlay] D3D9 bootstrap hook unavailable; in-game drawing is disabled, core module remains loaded.\n");
+}
 HANDLE thread = CreateThread(nullptr, 0, OverlayThread, nullptr, 0, nullptr);
 if (!thread)
 return false;
