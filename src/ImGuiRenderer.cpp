@@ -80,6 +80,8 @@ CallHookState g_endSceneHook{};
 volatile LONG g_hookMutationLock = 0;
 IDirect3DDevice9* g_imguiDevice = nullptr;
 ImFont* g_uiFont = nullptr;
+// Keep the glyph ranges alive until ImGui builds its font atlas (ranges are not copied).
+ImVector<ImWchar> g_uiGlyphRanges;
 std::chrono::steady_clock::time_point g_lastFrame{};
 
 class HookMutationGuard
@@ -525,10 +527,22 @@ bool InitializeImGuiForDevice(IDirect3DDevice9* device)
 
     const std::string gothicPath = WindowsFontPathUtf8(L"msgothic.ttc");
     const std::string meiryoPath = WindowsFontPathUtf8(L"meiryo.ttc");
+
+    // The built-in Japanese range is curated and may omit uncommon kanji used
+    // in game character names. U+8403 is 萃; include it explicitly so ImGui
+    // does not substitute '?' even though the source string is correct.
+    ImFontGlyphRangesBuilder rangeBuilder;
+    rangeBuilder.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+    rangeBuilder.AddChar(static_cast<ImWchar>(0x8403));
+    rangeBuilder.BuildRanges(&g_uiGlyphRanges);
+
+    ImFontConfig fontConfig{};
+    fontConfig.OversampleH = 3;
+    fontConfig.OversampleV = 2;
     if (!gothicPath.empty())
-        g_uiFont = io.Fonts->AddFontFromFileTTF(gothicPath.c_str(), 16.0f, nullptr, io.Fonts->GetGlyphRangesJapanese());
+        g_uiFont = io.Fonts->AddFontFromFileTTF(gothicPath.c_str(), 16.0f, &fontConfig, g_uiGlyphRanges.Data);
     if (!g_uiFont && !meiryoPath.empty())
-        g_uiFont = io.Fonts->AddFontFromFileTTF(meiryoPath.c_str(), 16.0f, nullptr, io.Fonts->GetGlyphRangesJapanese());
+        g_uiFont = io.Fonts->AddFontFromFileTTF(meiryoPath.c_str(), 16.0f, &fontConfig, g_uiGlyphRanges.Data);
     if (!g_uiFont)
         g_uiFont = io.Fonts->AddFontDefault();
     io.FontDefault = g_uiFont;

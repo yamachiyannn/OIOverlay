@@ -974,8 +974,10 @@ void DrawInfoPanel(ImDrawList* draw, int screenWidth, int screenHeight,
     const float left = 12.0f;
     const float top = (std::max)(8.0f, (static_cast<float>(screenHeight) - panelHeight) / 2.0f);
 
+    // The near-black fill at alpha 165/255 looked too opaque in-game.
+    // Lower alpha leaves more of the match visible while retaining readable text.
     AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
-        IM_COL32(8, 8, 12, 165), IM_COL32(90, 115, 145, 220));
+        IM_COL32(8, 8, 12, 100), IM_COL32(90, 115, 145, 155));
 
     float y = top + 5.0f;
     for (const auto& line : lines) {
@@ -993,22 +995,26 @@ void DrawInputPanel(ImDrawList* draw, int screenWidth, int screenHeight, const s
 
     const std::string inputUtf8 = WideToUtf8ForUi(inputLine);
     const std::string help = "1~9 / . / : / BS / Enter / Ctrl+V";
-    const float fontSize = 12.0f;
+    // The atlas font is baked at 16 px. Drawing it at 12 px resamples the glyphs
+    // and makes this small UI look softer and smaller than the old OIOv2 panel.
+    // Draw at the baked size so the glyphs stay crisp, and give the second line
+    // enough vertical room.
+    const float fontSize = 16.0f;
     const float maxPanelWidth = static_cast<float>((std::max)(120, (std::min)(screenWidth - 24, 520)));
     ImFont* font = ImGui::GetFont();
     const float measured = (std::max)(
         font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f, inputUtf8.c_str(), inputUtf8.c_str() + inputUtf8.size()).x,
         font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f, help.c_str(), help.c_str() + help.size()).x);
-    const float panelWidth = (std::min)(maxPanelWidth, (std::max)(190.0f, measured + 18.0f));
-    const float panelHeight = 42.0f;
+    const float panelWidth = (std::min)(maxPanelWidth, (std::max)(220.0f, measured + 20.0f));
+    const float panelHeight = 54.0f;
     const float left = 12.0f;
     const float top = (std::max)(8.0f, static_cast<float>(screenHeight) - panelHeight - 14.0f);
 
     AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
-        IM_COL32(10, 10, 10, 190), IM_COL32(90, 145, 110, 220));
-    draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, top + 3.0f),
+        IM_COL32(10, 10, 10, 175), IM_COL32(90, 145, 110, 200));
+    draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, top + 4.0f),
         IM_COL32(255, 255, 255, 255), inputUtf8.c_str());
-    draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, top + 22.0f),
+    draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, top + 29.0f),
         IM_COL32(190, 220, 200, 255), help.c_str());
 }
 
