@@ -108,47 +108,39 @@ bool BuildEpoch(
     long long& epoch
 )
 {
-    if (year < 1970 ||
-        year > 2200 ||
-        month < 1 ||
-        month > 12 ||
-        day < 1 ||
-        day > 31 ||
-        hour < 0 ||
-        hour > 23 ||
-        minute < 0 ||
-        minute > 59 ||
-        second < 0 ||
-        second > 59) {
+    if (year < 1970 || year > 2200 || month < 1 || month > 12 ||
+        day < 1 || day > 31 || hour < 0 || hour > 23 ||
+        minute < 0 || minute > 59 || second < 0 || second > 59) {
         return false;
     }
 
-    int days = 0;
+    // OIV treats timestamps without a timezone as local DateTime values.
+    // mktime gives the same local-time interpretation, avoiding a JST UTC+9
+    // mismatch when comparing stored timestamps with the current time.
+    std::tm local = {};
+    local.tm_year = year - 1900;
+    local.tm_mon = month - 1;
+    local.tm_mday = day;
+    local.tm_hour = hour;
+    local.tm_min = minute;
+    local.tm_sec = second;
+    local.tm_isdst = -1;
 
-    for (int y = 1970; y < year; ++y) {
-        days += IsLeap(y) ? 366 : 365;
+    const std::time_t converted = std::mktime(&local);
+    if (converted == static_cast<std::time_t>(-1))
+        return false;
+
+    // Reject impossible dates such as February 30 rather than accepting the
+    // normalization performed by mktime.
+    std::tm check = {};
+    if (localtime_s(&check, &converted) != 0 ||
+        check.tm_year != year - 1900 || check.tm_mon != month - 1 ||
+        check.tm_mday != day || check.tm_hour != hour ||
+        check.tm_min != minute || check.tm_sec != second) {
+        return false;
     }
 
-    static const int daysPerMonth[] = {
-        31, 28, 31, 30, 31, 30,
-        31, 31, 30, 31, 30, 31
-    };
-
-    for (int m = 1; m < month; ++m) {
-        days += daysPerMonth[m - 1];
-
-        if (m == 2 && IsLeap(year))
-            days++;
-    }
-
-    days += day - 1;
-
-    epoch =
-        static_cast<long long>(days) * 86400LL +
-        static_cast<long long>(hour) * 3600LL +
-        static_cast<long long>(minute) * 60LL +
-        second;
-
+    epoch = static_cast<long long>(converted);
     return true;
 }
 
@@ -454,10 +446,22 @@ TskMatchRecord ReadRecord(
                         second;
 
                     record.hasParsedTimestamp = true;
+                    formatEpochForDisplay = true;
                 }
             }
             }
         }
+    }
+
+    if (record.hasParsedTimestamp) {
+        // FILETIME values in the OIV/天則観 database are displayed by OIV as
+        // local wall-clock time minus nine hours. Keep epochSeconds untouched
+        // for display conversion, but use that same normalized time for the
+        // 30-minute active-run exclusion. Comparing the unadjusted FILETIME
+        // epoch made the age negative (about nine hours in the future), so a
+        // run that had just ended was incorrectly left visible.
+        record.freshnessEpochSeconds = record.epochSeconds -
+            (applyOivFileTimeShift ? 9LL * 60LL * 60LL : 0LL);
     }
 
     if (record.hasParsedTimestamp && formatEpochForDisplay) {
@@ -572,7 +576,8 @@ void BuildOivRuns(
         // Use the stored absolute timestamp for the 30-minute freshness check.
         // The display text intentionally follows OIV's presentation format,
         // while the freshness check must compare absolute timestamps.
-        current.endEpochSeconds = record.epochSeconds;
+        current.endEpochSeconds = record.freshnessEpochSeconds > 0
+            ? record.freshnessEpochSeconds : record.epochSeconds;
         // OIV treats P1 as the viewer and P2 as the opponent.
         if (record.p1Rounds >= 2)
             ++current.wins;
@@ -747,21 +752,25 @@ bool TskDatabase::GetOpponentStats(
 
     SortRecords(allRecords);
 
-    // Per-opponent totals use the same set of profile aliases as before,
-    // while the OIV run grouping must see all profiles before filtering.
+    // Filter the exact profile set first. If this player has no records,
+    // leave recentRuns empty as well; otherwise a caller could accidentally
+    // display globally-recent rows for an opponent with no matching history.
     std::vector<TskMatchRecord> records;
     records.reserve(allRecords.size());
     for (const auto& record : allRecords) {
         if (ContainsProfile(profilesCp932, record.p2NameCp932))
             records.push_back(record);
     }
-    BuildOivRuns(allRecords, profilesCp932, 5, 30, stats.recentRuns);
 
     if (records.empty()) {
         stats.found = false;
+        stats.recentRuns.clear();
         return true;
     }
 
+    // OIV groups adjacent records across the full ordered table by P2 profile,
+    // then associates each run with the matching player/profile aggregate.
+    BuildOivRuns(allRecords, profilesCp932, 5, 30, stats.recentRuns);
     stats.found = true;
 
     SortRecords(records);

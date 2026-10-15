@@ -9,6 +9,8 @@ struct TskMatchRecord {
     long long timestampKey = 0;
     bool hasParsedTimestamp = false;
     long long epochSeconds = 0;
+    // Timestamp normalized to the local match time used by OIV, for freshness checks.
+    long long freshnessEpochSeconds = 0;
 
     std::string p1NameCp932;
     std::string p2NameCp932;

@@ -57,9 +57,10 @@ int g_displayPage = 0;
 bool g_titleHistoryVisible = false;
 std::vector<std::wstring> g_titleHistoryLines;
 int g_reversalCounterCount = 0;
-bool g_reversalCounterVisible = false;
+bool g_reversalCounterLiveVisible = false;
+bool g_reversalCounterSummaryVisible = false;
+int g_reversalCounterSummaryCount = 0;
 std::wstring g_reversalCounterStatus;
-std::vector<std::wstring> g_reversalCounterHistory;
 bool g_tskRunning = false;
 enum class TskWarningState { None, NotRunning, GameNotDetected };
 TskWarningState g_tskWarningState = TskWarningState::None;
@@ -73,7 +74,8 @@ std::string g_watchingP2Profile;
 std::string g_cachedNormalProfile;
 std::string g_cachedWatchingP1;
 std::string g_cachedWatchingP2;
-std::string g_inputBuffer;
+std::wstring g_inputBuffer;
+size_t g_inputCursor = 0;
 std::vector<std::wstring> g_infoLines;
 std::wstring g_inputLine;
 bool g_copiedFeedback = false;
@@ -291,7 +293,10 @@ std::wstring ShortRunDate(const std::string& value)
     int year = 0, month = 0, day = 0;
     if (sscanf_s(value.c_str(), "%d/%d/%d", &year, &month, &day) == 3 ||
         sscanf_s(value.c_str(), "%d-%d-%d", &year, &month, &day) == 3) {
-        return std::to_wstring(month) + L"/" + std::to_wstring(day);
+        std::wostringstream out;
+        out << std::setfill(L'0') << std::setw(2) << month << L"/"
+            << std::setw(2) << day;
+        return out.str();
     }
     return value.empty() ? L"--/--" : NarrowAsciiToWide(value);
 }
@@ -299,12 +304,12 @@ std::wstring ShortRunDate(const std::string& value)
 std::wstring RunLine(const TskRunStats& run, bool includeProfile)
 {
     std::wostringstream out;
-    out << ShortRunDate(run.endDateText) << L"　";
-    if (includeProfile)
-        out << ProfileDisplayName(run.profileNameCp932) << L"　";
-    out << std::setw(2) << run.wins << L"勝 "
-        << std::setw(3) << run.losses << L"敗　("
+    out << ShortRunDate(run.endDateText) << L"  "
+        << std::setw(2) << run.wins << L"勝 "
+        << std::setw(2) << run.losses << L"敗　("
         << RateText(run.wins, run.losses) << L")";
+    if (includeProfile)
+        out << L"　[" << ProfileDisplayName(run.profileNameCp932) << L"]";
     return out.str();
 }
 
@@ -536,7 +541,7 @@ return text;
 
 std::wstring BuildNormalSecondaryInfo()
 {
-    std::wstring text = L"【メインキャラ限定 / 連戦履歴】\n\n";
+    std::wstring text = L"【対戦中】\n\n";
     if (g_opponentProfile.empty())
         return text + L"対戦相手を取得中...";
     if (!g_normalStatsValid || !g_normalStats.found)
@@ -580,7 +585,7 @@ void AppendWatchingSecondaryPlayer(
 
 std::wstring BuildWatchingSecondaryInfo()
 {
-    std::wstring text = L"【観戦中：メインキャラ限定 / 連戦履歴】\n\n";
+    std::wstring text = L"【観戦中】\n\n";
     if (g_watchingP1Profile.empty() || g_watchingP2Profile.empty())
         return text + L"1P / 2Pのプロファイルを取得中...";
     AppendWatchingSecondaryPlayer(text, L"1P", g_watchP1Stats, g_watchP1StatsValid);
@@ -604,170 +609,233 @@ start = end + 1;
 }
 }
 
-bool SetClipboardText(const std::string& text)
+bool SetClipboardText(const std::wstring& text)
 {
-if (text.empty()) {
-g_clipboardError.store(ERROR_SUCCESS);
-return false;
-}
-const int chars = MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, nullptr, 0);
-if (chars <= 0) {
-g_clipboardError.store(ERROR_NO_UNICODE_TRANSLATION);
-return false;
-}
-std::wstring wide(static_cast<size_t>(chars), L'\0');
-if (MultiByteToWideChar(CP_ACP, 0, text.c_str(), -1, &wide[0], chars) <= 0) {
-g_clipboardError.store(ERROR_NO_UNICODE_TRANSLATION);
-return false;
-}
-HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, wide.size() * sizeof(wchar_t));
-if (!memory) {
-g_clipboardError.store(GetLastError());
-return false;
-}
-void* target = GlobalLock(memory);
-if (!target) {
-const DWORD error = GetLastError();
-GlobalFree(memory);
-g_clipboardError.store(error);
-return false;
-}
-std::memcpy(target, wide.c_str(), wide.size() * sizeof(wchar_t));
-GlobalUnlock(memory);
-if (!OpenClipboard(nullptr)) {
-const DWORD error = GetLastError();
-GlobalFree(memory);
-g_clipboardError.store(error);
-return false;
-}
-if (!EmptyClipboard()) {
-const DWORD error = GetLastError();
-CloseClipboard();
-GlobalFree(memory);
-g_clipboardError.store(error);
-return false;
-}
-if (!SetClipboardData(CF_UNICODETEXT, memory)) {
-const DWORD error = GetLastError();
-CloseClipboard();
-GlobalFree(memory);
-g_clipboardError.store(error);
-return false;
-}
-// Ownership of memory transfers to the system after successful SetClipboardData.
-CloseClipboard();
-g_clipboardError.store(ERROR_SUCCESS);
-return true;
+    if (text.empty()) {
+        g_clipboardError.store(ERROR_SUCCESS);
+        return false;
+    }
+
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t));
+    if (!memory) {
+        g_clipboardError.store(GetLastError());
+        return false;
+    }
+    void* target = GlobalLock(memory);
+    if (!target) {
+        const DWORD error = GetLastError();
+        GlobalFree(memory);
+        g_clipboardError.store(error);
+        return false;
+    }
+    std::memcpy(target, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+    GlobalUnlock(memory);
+    if (!OpenClipboard(nullptr)) {
+        const DWORD error = GetLastError();
+        GlobalFree(memory);
+        g_clipboardError.store(error);
+        return false;
+    }
+    if (!EmptyClipboard()) {
+        const DWORD error = GetLastError();
+        CloseClipboard();
+        GlobalFree(memory);
+        g_clipboardError.store(error);
+        return false;
+    }
+    if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+        const DWORD error = GetLastError();
+        CloseClipboard();
+        GlobalFree(memory);
+        g_clipboardError.store(error);
+        return false;
+    }
+    // Ownership transfers to the clipboard on success.
+    CloseClipboard();
+    g_clipboardError.store(ERROR_SUCCESS);
+    return true;
 }
 
 bool IsGameForeground()
 {
-HWND foreground = GetForegroundWindow();
-if (!foreground)
-return false;
-DWORD processId = 0;
-GetWindowThreadProcessId(foreground, &processId);
-return processId == GetCurrentProcessId();
+    HWND foreground = GetForegroundWindow();
+    if (!foreground)
+        return false;
+    DWORD processId = 0;
+    GetWindowThreadProcessId(foreground, &processId);
+    return processId == GetCurrentProcessId();
 }
 
 bool IsAltDown()
 {
-return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
-(GetAsyncKeyState(VK_LMENU) & 0x8000) != 0 ||
-(GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
+    return (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
 }
 
 bool IsControlDown()
 {
-return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-(GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-(GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+    return (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
 }
 
-std::string GetInputBufferSnapshot()
+std::wstring GetInputBufferSnapshot()
 {
-std::lock_guard<std::mutex> lock(g_inputMutex);
-return g_inputBuffer;
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    return g_inputBuffer;
 }
 
 void ClearInputBuffer()
 {
-std::lock_guard<std::mutex> lock(g_inputMutex);
-g_inputBuffer.clear();
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_inputBuffer.clear();
+    g_inputCursor = 0;
 }
 
 void AppendIpCharacter(char character)
 {
-constexpr size_t kMaximumInputLength = 64;
-std::lock_guard<std::mutex> lock(g_inputMutex);
-g_copiedFeedback = false;
-if (g_inputBuffer.size() < kMaximumInputLength)
-g_inputBuffer.push_back(character);
+    constexpr size_t kMaximumInputLength = 64;
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_copiedFeedback = false;
+    if (g_inputBuffer.size() < kMaximumInputLength && g_inputCursor <= g_inputBuffer.size()) {
+        g_inputBuffer.insert(g_inputCursor, 1, static_cast<wchar_t>(static_cast<unsigned char>(character)));
+        ++g_inputCursor;
+    }
 }
 
-void RemoveLastIpCharacter()
+bool IsHighSurrogate(wchar_t value)
 {
-std::lock_guard<std::mutex> lock(g_inputMutex);
-g_copiedFeedback = false;
-if (!g_inputBuffer.empty())
-g_inputBuffer.pop_back();
+    return value >= 0xD800 && value <= 0xDBFF;
+}
+
+bool IsLowSurrogate(wchar_t value)
+{
+    return value >= 0xDC00 && value <= 0xDFFF;
+}
+
+void MoveIpCursorLeft()
+{
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_copiedFeedback = false;
+    if (g_inputCursor > 0) {
+        --g_inputCursor;
+        if (g_inputCursor > 0 && g_inputCursor < g_inputBuffer.size() &&
+            IsLowSurrogate(g_inputBuffer[g_inputCursor]) &&
+            IsHighSurrogate(g_inputBuffer[g_inputCursor - 1])) {
+            --g_inputCursor;
+        }
+    }
+}
+
+void MoveIpCursorRight()
+{
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_copiedFeedback = false;
+    if (g_inputCursor < g_inputBuffer.size()) {
+        if (IsHighSurrogate(g_inputBuffer[g_inputCursor]) &&
+            g_inputCursor + 1 < g_inputBuffer.size() &&
+            IsLowSurrogate(g_inputBuffer[g_inputCursor + 1])) {
+            g_inputCursor += 2;
+        } else {
+            ++g_inputCursor;
+        }
+    }
+}
+
+void RemoveIpCharacterBeforeCursor()
+{
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_copiedFeedback = false;
+    if (g_inputCursor > 0 && g_inputCursor <= g_inputBuffer.size()) {
+        size_t eraseStart = g_inputCursor - 1;
+        size_t eraseLength = 1;
+        if (IsLowSurrogate(g_inputBuffer[eraseStart]) && eraseStart > 0 &&
+            IsHighSurrogate(g_inputBuffer[eraseStart - 1])) {
+            --eraseStart;
+            eraseLength = 2;
+        }
+        g_inputBuffer.erase(eraseStart, eraseLength);
+        g_inputCursor = eraseStart;
+    }
+}
+
+void RemoveIpCharacterAtCursor()
+{
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_copiedFeedback = false;
+    if (g_inputCursor < g_inputBuffer.size()) {
+        const size_t eraseLength = IsHighSurrogate(g_inputBuffer[g_inputCursor]) &&
+            g_inputCursor + 1 < g_inputBuffer.size() &&
+            IsLowSurrogate(g_inputBuffer[g_inputCursor + 1]) ? 2 : 1;
+        g_inputBuffer.erase(g_inputCursor, eraseLength);
+    }
 }
 
 void CopyInputToClipboardAndClear()
 {
-const std::string value = GetInputBufferSnapshot();
-if (value.empty()) {
-// Empty Enter is intentionally a no-op: do not touch the clipboard and
-// do not show the transient "Copied" feedback.
-g_clipboardStatus.store(0);
-std::lock_guard<std::mutex> lock(g_inputMutex);
-g_copiedFeedback = false;
-return;
-}
+    const std::wstring value = GetInputBufferSnapshot();
+    if (value.empty()) {
+        // Empty Enter is intentionally a no-op: do not touch the clipboard.
+        g_clipboardStatus.store(0);
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        g_copiedFeedback = false;
+        return;
+    }
 
-if (SetClipboardText(value)) {
-g_clipboardStatus.store(1);
-ClearInputBuffer();
-{
-std::lock_guard<std::mutex> lock(g_inputMutex);
-g_copiedFeedback = true;
-g_copiedFeedbackUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-}
-} else {
-// Preserve the text so the user can retry if Windows denies clipboard access.
-g_clipboardStatus.store(2);
-}
+    if (SetClipboardText(value)) {
+        g_clipboardStatus.store(1);
+        ClearInputBuffer();
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        g_copiedFeedback = true;
+        g_copiedFeedbackUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    } else {
+        // Preserve text and caret if Windows denies clipboard access.
+        g_clipboardStatus.store(2);
+    }
 }
 
 bool PasteClipboardIp()
 {
-if (!OpenClipboard(nullptr))
-return false;
+    if (!OpenClipboard(nullptr))
+        return false;
 
-HANDLE clipboardData = GetClipboardData(CF_UNICODETEXT);
-if (!clipboardData) {
-CloseClipboard();
-return false;
-}
+    HANDLE clipboardData = GetClipboardData(CF_UNICODETEXT);
+    if (!clipboardData) {
+        CloseClipboard();
+        return false;
+    }
 
-const wchar_t* source = static_cast<const wchar_t*>(GlobalLock(clipboardData));
-if (!source) {
-CloseClipboard();
-return false;
-}
+    const wchar_t* source = static_cast<const wchar_t*>(GlobalLock(clipboardData));
+    if (!source) {
+        CloseClipboard();
+        return false;
+    }
+    const std::wstring clipboardText(source);
+    GlobalUnlock(clipboardData);
+    CloseClipboard();
 
-std::wstring value(source);
-GlobalUnlock(clipboardData);
-CloseClipboard();
+    // Prefer a valid IPv4:port token wherever one appears in the clipboard.
+    // If none exists, preserve the original input contract: only ASCII digits,
+    // dots and colons are accepted, in their original order. Do not inject
+    // arbitrary Unicode or other punctuation into the IP:Port field.
+    std::string normalized;
+    std::wstring replacement;
+    if (ExtractFirstValidIpPort(clipboardText, normalized)) {
+        replacement.assign(normalized.begin(), normalized.end());
+    } else {
+        replacement.reserve(clipboardText.size());
+        for (wchar_t ch : clipboardText) {
+            if ((ch >= L'0' && ch <= L'9') || ch == L'.' || ch == L':')
+                replacement.push_back(ch);
+        }
+    }
 
-std::string normalized;
-if (!ExtractFirstValidIpPort(value, normalized))
-return false;
-
-std::lock_guard<std::mutex> lock(g_inputMutex);
-g_copiedFeedback = false;
-g_inputBuffer = normalized;
-return true;
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_copiedFeedback = false;
+    g_inputBuffer = std::move(replacement);
+    g_inputCursor = g_inputBuffer.size();
+    return true;
 }
 
 bool IsAltPressed(const KBDLLHOOKSTRUCT& key)
@@ -969,6 +1037,22 @@ return false;
 const int oldScene = g_sceneId;
 g_sceneId = scene;
 
+// Keep the counter through round transitions until SceneID returns to <= 7.
+// Once finalized, retain the large result until a new battle (13/14) starts.
+const bool newBattleScene = (scene == 13 || scene == 14);
+if (scene <= 7 && oldScene > 7 && g_reversalCounterLiveVisible) {
+    g_reversalCounterSummaryCount = g_reversalCounterCount;
+    g_reversalCounterSummaryVisible = true;
+    g_reversalCounterLiveVisible = false;
+}
+if (newBattleScene && g_reversalCounterSummaryVisible) {
+    g_reversalCounterCount = 0;
+    g_reversalCounterSummaryCount = 0;
+    g_reversalCounterSummaryVisible = false;
+    g_reversalCounterLiveVisible = false;
+    g_reversalCounterStatus.clear();
+}
+
     if (scene <= 7) {
         g_displayPage = 0;
         g_titleHistoryVisible = false;
@@ -1045,6 +1129,19 @@ g_opponentProfile.clear();
 return true;
 }
 
+bool CanFlipToSecondaryPage(int scene)
+{
+    if (IsNormalInfoScene(scene)) {
+        // A first-time opponent (or a run hidden as still active) has no
+        // meaningful page-2 run history; keep the compact primary page stable.
+        return g_normalStatsValid && g_normalStats.found &&
+            g_normalStats.totalMatches > 0 && !g_normalStats.recentRuns.empty();
+    }
+    if (scene == 12 || scene == 15)
+        return g_watchP1StatsValid || g_watchP2StatsValid;
+    return false;
+}
+
 void UpdateInfoText()
 {
     std::vector<std::wstring> next;
@@ -1065,10 +1162,15 @@ void UpdateInputText()
     if (g_copiedFeedback && std::chrono::steady_clock::now() >= g_copiedFeedbackUntil)
         g_copiedFeedback = false;
     if (g_inputEnabled && g_sceneId == 2) {
-        if (g_copiedFeedback)
+        if (g_copiedFeedback) {
             next = L"IP:Port ＞ Copied";
-        else
-            next = L"IP:Port ＞ " + NarrowAsciiToWide(g_inputBuffer) + L"_";
+        } else {
+            next = L"IP:Port ＞ ";
+            const size_t cursor = (std::min)(g_inputCursor, g_inputBuffer.size());
+            next.append(g_inputBuffer, 0, cursor);
+            next += L"_";
+            next.append(g_inputBuffer, cursor, std::wstring::npos);
+        }
     }
     if (next != g_inputLine) {
         g_inputLine = std::move(next);
@@ -1078,8 +1180,8 @@ void UpdateInputText()
 struct RenderSnapshot
 {
     std::vector<std::wstring> infoLines;
+    std::vector<std::wstring> alternateInfoLines;
     std::vector<std::wstring> titleHistoryLines;
-    std::vector<std::wstring> reversalCounterLines;
     std::wstring inputLine;
     int sceneId = -1;
     int warningState = 0;
@@ -1087,7 +1189,11 @@ struct RenderSnapshot
     bool inputVisible = false;
     bool warningBlink = false;
     bool titleHistoryVisible = false;
-    bool reversalCounterVisible = false;
+    bool reversalCounterLiveVisible = false;
+    bool reversalCounterSummaryVisible = false;
+    int reversalCounterCount = 0;
+    int reversalCounterSummaryCount = 0;
+    std::wstring reversalCounterStatus;
 };
 
 std::mutex g_renderSnapshotMutex;
@@ -1097,16 +1203,21 @@ void PublishRenderSnapshot()
 {
     RenderSnapshot next;
     next.infoLines = g_infoLines;
+    if (g_overlayEnabled && (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15)) {
+        std::vector<std::wstring> alternate;
+        if (IsNormalInfoScene(g_sceneId))
+            SplitLines(g_displayPage == 0 ? BuildNormalSecondaryInfo() : BuildNormalInfo(), alternate);
+        else
+            SplitLines(g_displayPage == 0 ? BuildWatchingSecondaryInfo() : BuildWatchingInfo(), alternate);
+        next.alternateInfoLines = std::move(alternate);
+    }
     next.titleHistoryLines = g_titleHistoryLines;
     next.titleHistoryVisible = g_titleHistoryVisible;
-    next.reversalCounterVisible = g_reversalCounterVisible;
-    next.reversalCounterLines.push_back(L"リバサルミネスカウンター : " + std::to_wstring(g_reversalCounterCount));
-    if (!g_reversalCounterStatus.empty())
-        next.reversalCounterLines.push_back(g_reversalCounterStatus);
-    const size_t reversalFirst = g_reversalCounterHistory.size() > 5
-        ? g_reversalCounterHistory.size() - 5 : 0;
-    for (size_t i = g_reversalCounterHistory.size(); i > reversalFirst; --i)
-        next.reversalCounterLines.push_back(g_reversalCounterHistory[i - 1]);
+    next.reversalCounterLiveVisible = g_reversalCounterLiveVisible;
+    next.reversalCounterSummaryVisible = g_reversalCounterSummaryVisible;
+    next.reversalCounterCount = g_reversalCounterCount;
+    next.reversalCounterSummaryCount = g_reversalCounterSummaryCount;
+    next.reversalCounterStatus = g_reversalCounterStatus;
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
         next.inputLine = g_inputLine;
@@ -1149,8 +1260,13 @@ void AddPanel(ImDrawList* draw, const ImVec2& min, const ImVec2& max,
     draw->AddRect(min, max, border, 4.0f, 0, 1.0f);
 }
 
-void DrawInfoPanel(ImDrawList* draw, int screenWidth, int screenHeight,
-    const std::vector<std::wstring>& sourceLines, bool alignTop = false)
+void DrawInfoPanel(
+    ImDrawList* draw,
+    int screenWidth,
+    int screenHeight,
+    const std::vector<std::wstring>& sourceLines,
+    const std::vector<std::wstring>* stableLayoutLines = nullptr,
+    bool alignTop = false)
 {
     if (sourceLines.empty() || screenWidth <= 24 || screenHeight <= 24)
         return;
@@ -1159,46 +1275,57 @@ void DrawInfoPanel(ImDrawList* draw, int screenWidth, int screenHeight,
     const float lineBaseHeight = 14.0f;
     const float maxPanelWidth = static_cast<float>((std::max)(120, (std::min)(screenWidth - 24, 620)));
     const float maxTextWidth = (std::max)(60.0f, maxPanelWidth - 18.0f);
-    std::vector<UiTextLine> lines;
-    lines.reserve(sourceLines.size());
-    float widest = 0.0f;
-
     ImFont* font = ImGui::GetFont();
-    for (size_t i = 0; i < sourceLines.size(); ++i) {
-        std::string line = WideToUtf8ForUi(sourceLines[i]);
-        const ImVec2 unwrapped = font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f,
-            line.c_str(), line.c_str() + line.size());
-        const ImVec2 wrapped = font->CalcTextSizeA(fontSize, maxTextWidth, maxTextWidth,
-            line.c_str(), line.c_str() + line.size());
-        widest = (std::max)(widest, (std::min)(unwrapped.x, maxTextWidth));
-        const float height = (std::max)(lineBaseHeight, wrapped.y);
-        lines.push_back({ std::move(line), i == 0 ? IM_COL32(185, 220, 255, 255) : IM_COL32(245, 245, 245, 255), height });
-    }
+
+    auto prepareLines = [&](const std::vector<std::wstring>& source, std::vector<UiTextLine>& output, float& widest) {
+        output.clear();
+        output.reserve(source.size());
+        for (size_t i = 0; i < source.size(); ++i) {
+            std::string line = WideToUtf8ForUi(source[i]);
+            const ImVec2 unwrapped = font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f,
+                line.c_str(), line.c_str() + line.size());
+            widest = (std::max)(widest, (std::min)(unwrapped.x, maxTextWidth));
+            output.push_back({ std::move(line), i == 0 ? IM_COL32(185, 220, 255, 255) : IM_COL32(245, 245, 245, 255), lineBaseHeight });
+        }
+    };
+
+    std::vector<UiTextLine> lines;
+    std::vector<UiTextLine> layoutLines;
+    float widest = 0.0f;
+    prepareLines(sourceLines, lines, widest);
+    if (stableLayoutLines != nullptr && !stableLayoutLines->empty())
+        prepareLines(*stableLayoutLines, layoutLines, widest);
 
     const float panelWidth = (std::min)(maxPanelWidth, (std::max)(150.0f, widest + 18.0f));
     const float textWidth = (std::max)(40.0f, panelWidth - 16.0f);
-    float contentHeight = 0.0f;
-    for (auto& line : lines) {
-        const ImVec2 wrapped = font->CalcTextSizeA(fontSize, textWidth, textWidth,
-            line.text.c_str(), line.text.c_str() + line.text.size());
-        line.height = (std::max)(lineBaseHeight, wrapped.y);
-        contentHeight += line.height;
-    }
-    const float panelHeight = contentHeight + 12.0f;
+    auto contentHeightFor = [&](std::vector<UiTextLine>& measuredLines) {
+        float result = 0.0f;
+        for (auto& line : measuredLines) {
+            const ImVec2 wrapped = font->CalcTextSizeA(fontSize, textWidth, textWidth,
+                line.text.c_str(), line.text.c_str() + line.text.size());
+            line.height = (std::max)(lineBaseHeight, wrapped.y);
+            result += line.height;
+        }
+        return result;
+    };
+
+    const float currentContentHeight = contentHeightFor(lines);
+    const float otherContentHeight = layoutLines.empty() ? 0.0f : contentHeightFor(layoutLines);
+    // Both statistics pages share the same anchor and the larger of their
+    // widths/heights, so flipping pages never makes the panel jump.
+    const float panelHeight = (std::max)(currentContentHeight, otherContentHeight) + 12.0f;
     const float left = 12.0f;
     const float top = alignTop
         ? 12.0f
         : (std::max)(8.0f, (static_cast<float>(screenHeight) - panelHeight) / 2.0f);
 
-    // The near-black fill at alpha 165/255 looked too opaque in-game.
-    // Lower alpha leaves more of the match visible while retaining readable text.
     AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
         IM_COL32(8, 8, 12, 100), IM_COL32(90, 115, 145, 155));
 
     float y = top + 5.0f;
     for (const auto& line : lines) {
         if (!line.text.empty())
-            draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, y), line.color,
+            draw->AddText(font, fontSize, ImVec2(left + 8.0f, y), line.color,
                 line.text.c_str(), line.text.c_str() + line.text.size(), textWidth);
         y += line.height;
     }
@@ -1210,27 +1337,34 @@ void DrawInputPanel(ImDrawList* draw, int screenWidth, int screenHeight, const s
         return;
 
     const std::string inputUtf8 = WideToUtf8ForUi(inputLine);
-    const std::string help = "1~9 / . / : / BS / Enter / Ctrl+V";
-    // The atlas font is baked at 16 px. Drawing it at 12 px resamples the glyphs
-    // and makes this small UI look softer and smaller than the old OIOv2 panel.
-    // Draw at the baked size so the glyphs stay crisp, and give the second line
-    // enough vertical room.
+    const std::string help = "0~9 / . / : / Left / Right / BS / Del / Enter / Ctrl+V";
     const float fontSize = 16.0f;
     const float maxPanelWidth = static_cast<float>((std::max)(120, (std::min)(screenWidth - 24, 520)));
     ImFont* font = ImGui::GetFont();
-    const float measured = (std::max)(
-        font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f, inputUtf8.c_str(), inputUtf8.c_str() + inputUtf8.size()).x,
-        font->CalcTextSizeA(fontSize, 1000000.0f, 0.0f, help.c_str(), help.c_str() + help.size()).x);
-    const float panelWidth = (std::min)(maxPanelWidth, (std::max)(220.0f, measured + 20.0f));
-    const float panelHeight = 54.0f;
+    const ImVec2 inputUnwrapped = font->CalcTextSizeA(fontSize, 100000.0f, 0.0f,
+        inputUtf8.c_str(), inputUtf8.c_str() + inputUtf8.size());
+    const ImVec2 helpUnwrapped = font->CalcTextSizeA(fontSize, 100000.0f, 0.0f,
+        help.c_str(), help.c_str() + help.size());
+    const float panelWidth = (std::min)(maxPanelWidth,
+        (std::max)(220.0f, (std::max)(inputUnwrapped.x, helpUnwrapped.x) + 20.0f));
+    const float textWidth = (std::max)(60.0f, panelWidth - 16.0f);
+    const ImVec2 inputWrapped = font->CalcTextSizeA(fontSize, textWidth, textWidth,
+        inputUtf8.c_str(), inputUtf8.c_str() + inputUtf8.size());
+    const float helpHeight = (std::max)(fontSize, helpUnwrapped.y);
+    const float maxFieldHeight = (std::max)(fontSize, static_cast<float>(screenHeight) - helpHeight - 48.0f);
+    const float inputHeight = (std::min)((std::max)(fontSize, inputWrapped.y), maxFieldHeight);
+    const float panelHeight = (std::min)(inputHeight + helpHeight + 17.0f, static_cast<float>(screenHeight - 24));
     const float left = 12.0f;
     const float top = (std::max)(8.0f, static_cast<float>(screenHeight) - panelHeight - 14.0f);
 
     AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
         IM_COL32(10, 10, 10, 175), IM_COL32(90, 145, 110, 200));
-    draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, top + 4.0f),
-        IM_COL32(255, 255, 255, 255), inputUtf8.c_str());
-    draw->AddText(ImGui::GetFont(), fontSize, ImVec2(left + 8.0f, top + 29.0f),
+    const ImVec4 inputClip(left + 5.0f, top + 3.0f, left + panelWidth - 5.0f,
+        (std::min)(top + 4.0f + inputHeight, top + panelHeight - helpHeight - 8.0f));
+    draw->AddText(font, fontSize, ImVec2(left + 8.0f, top + 4.0f),
+        IM_COL32(255, 255, 255, 255), inputUtf8.c_str(), inputUtf8.c_str() + inputUtf8.size(), textWidth, &inputClip);
+    const float helpTop = (std::min)(top + 8.0f + inputHeight, top + panelHeight - helpHeight - 4.0f);
+    draw->AddText(font, fontSize, ImVec2(left + 8.0f, helpTop),
         IM_COL32(190, 220, 200, 255), help.c_str());
 }
 
@@ -1268,6 +1402,55 @@ void DrawWarningPanel(ImDrawList* draw, int screenWidth, int screenHeight, int w
         IM_COL32(255, 255, 255, 255), subtitle.c_str(), subtitle.c_str() + subtitle.size(), panelWidth - 24.0f);
 }
 
+void DrawLiveReversalCounter(ImDrawList* draw, int screenWidth, int count, const std::wstring& status)
+{
+    if (screenWidth <= 64)
+        return;
+    const float fontSize = 14.0f;
+    const std::string label = "RL: " + std::to_string(count);
+    ImFont* font = ImGui::GetFont();
+    const ImVec2 textSize = font->CalcTextSizeA(fontSize, 100000.0f, 0.0f,
+        label.c_str(), label.c_str() + label.size());
+    const float paddingX = 5.0f;
+    const float paddingY = 3.0f;
+    const float statusHeight = status.empty() ? 0.0f : 13.0f;
+    const float panelWidth = textSize.x + paddingX * 2.0f;
+    const float panelHeight = textSize.y + paddingY * 2.0f + statusHeight;
+    const float left = static_cast<float>(screenWidth) - panelWidth - 12.0f;
+    const float top = 12.0f;
+    AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
+        IM_COL32(8, 8, 12, 125), IM_COL32(90, 115, 145, 175));
+    draw->AddText(font, fontSize, ImVec2(left + paddingX, top + paddingY),
+        IM_COL32(255, 255, 255, 255), label.c_str());
+    if (!status.empty()) {
+        const std::string statusUtf8 = WideToUtf8ForUi(status);
+        draw->AddText(font, 9.0f, ImVec2(left + paddingX, top + paddingY + textSize.y),
+            IM_COL32(255, 130, 130, 255), statusUtf8.c_str());
+    }
+}
+
+void DrawReversalCounterSummary(ImDrawList* draw, int screenWidth, int screenHeight, int count)
+{
+    if (screenWidth <= 24 || screenHeight <= 24)
+        return;
+    const std::string label = "RL: " + std::to_string(count);
+    const float fontSize = 48.0f;
+    ImFont* font = ImGui::GetFont();
+    const ImVec2 textSize = font->CalcTextSizeA(fontSize, 100000.0f, 0.0f,
+        label.c_str(), label.c_str() + label.size());
+    const float paddingX = 28.0f;
+    const float paddingY = 18.0f;
+    const float panelWidth = textSize.x + paddingX * 2.0f;
+    const float panelHeight = textSize.y + paddingY * 2.0f;
+    const float left = (static_cast<float>(screenWidth) - panelWidth) / 2.0f;
+    const float top = (static_cast<float>(screenHeight) - panelHeight) / 2.0f;
+    AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
+        IM_COL32(8, 8, 12, 165), IM_COL32(125, 165, 205, 220));
+    const float textLeft = left + (panelWidth - textSize.x) / 2.0f;
+    draw->AddText(font, fontSize, ImVec2(textLeft, top + paddingY),
+        IM_COL32(255, 255, 255, 255), label.c_str());
+}
+
 void RenderGameUi(int screenWidth, int screenHeight)
 {
     // This callback runs on the game render thread. The snapshot is produced by
@@ -1285,12 +1468,16 @@ void RenderGameUi(int screenWidth, int screenHeight)
 
     // Render in this order so the TSK warning remains visible above the other panels.
     if (snapshot.titleHistoryVisible && snapshot.sceneId == 2) {
-        DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.titleHistoryLines, true);
+        DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.titleHistoryLines, nullptr, true);
     } else if (snapshot.overlayEnabled) {
-        DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.infoLines);
+        DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.infoLines,
+            snapshot.alternateInfoLines.empty() ? nullptr : &snapshot.alternateInfoLines, false);
     }
-    if (snapshot.reversalCounterVisible && (snapshot.sceneId == 13 || snapshot.sceneId == 14))
-        DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.reversalCounterLines, true);
+    if (snapshot.reversalCounterLiveVisible && (snapshot.sceneId == 13 || snapshot.sceneId == 14))
+        DrawLiveReversalCounter(draw, screenWidth, snapshot.reversalCounterCount, snapshot.reversalCounterStatus);
+    if (snapshot.reversalCounterSummaryVisible && snapshot.sceneId <= 7 &&
+        !(snapshot.sceneId == 2 && snapshot.titleHistoryVisible))
+        DrawReversalCounterSummary(draw, screenWidth, screenHeight, snapshot.reversalCounterSummaryCount);
     if (snapshot.inputVisible)
         DrawInputPanel(draw, screenWidth, screenHeight, snapshot.inputLine);
     DrawWarningPanel(draw, screenWidth, screenHeight, snapshot.warningState, snapshot.warningBlink);
@@ -1299,7 +1486,7 @@ void RenderGameUi(int screenWidth, int screenHeight)
 void RefreshTitleHistory()
 {
     std::vector<std::wstring> lines;
-    lines.push_back(L"【連戦履歴：直近10回】");
+    lines.push_back(L"【連戦履歴】");
     if (!g_database || !g_database->IsAvailable()) {
         lines.push_back(L"天則観の対戦記録を読み込めません");
         g_titleHistoryLines = std::move(lines);
@@ -1307,7 +1494,7 @@ void RefreshTitleHistory()
     }
 
     std::vector<TskRunStats> runs;
-    if (!g_database->GetRecentRuns(10, 30, runs)) {
+    if (!g_database->GetRecentRuns(20, 30, runs)) {
         lines.push_back(L"連戦履歴の読み込みに失敗しました");
     } else if (runs.empty()) {
         lines.push_back(L"表示できる連戦履歴がありません");
@@ -1327,24 +1514,19 @@ void RegisterReversalCounter()
     std::string opponent = ReadProfile(offset);
     if (opponent.empty())
         opponent = g_opponentProfile;
-    if (opponent.empty())
-        opponent = "";
 
-    std::wstring opponentWide = opponent.empty() ? L"不明" : Cp932ToWide(opponent);
+    const std::wstring opponentWide = opponent.empty() ? L"不明" : Cp932ToWide(opponent);
     const std::wstring line = CurrentCounterTimestamp() + L"_[" + opponentWide + L"]";
-    g_reversalCounterVisible = true;
-    g_reversalCounterStatus.clear();
 
+    // Count the press immediately. A disk error is reported in the live HUD
+    // but does not discard the in-memory count for the current match.
+    ++g_reversalCounterCount;
+    g_reversalCounterLiveVisible = true;
+    g_reversalCounterStatus.clear();
     if (!AppendCounterText(line)) {
         g_reversalCounterStatus = L"RLcounter.txt への保存に失敗しました";
         OutputDebugStringW(L"[OIOverlay] Failed to append RLcounter.txt next to the module.\n");
-        return;
     }
-
-    ++g_reversalCounterCount;
-    g_reversalCounterHistory.push_back(line);
-    if (g_reversalCounterHistory.size() > 50)
-        g_reversalCounterHistory.erase(g_reversalCounterHistory.begin(), g_reversalCounterHistory.end() - 50);
 }
 
 void PollIpInputFromGameFrame()
@@ -1356,7 +1538,7 @@ static const DWORD keysToPoll[] = {
 VK_NUMPAD0,VK_NUMPAD1,VK_NUMPAD2,VK_NUMPAD3,VK_NUMPAD4,
 VK_NUMPAD5,VK_NUMPAD6,VK_NUMPAD7,VK_NUMPAD8,VK_NUMPAD9,
 VK_DECIMAL, VK_OEM_PERIOD, VK_OEM_1, VK_OEM_PLUS,
-VK_BACK, VK_RETURN, 'V'
+VK_BACK, VK_DELETE, VK_LEFT, VK_RIGHT, VK_RETURN, 'V'
 };
 
 const bool inputMode = g_inputEnabled.load() && g_sceneId.load() == 2 && IsGameForeground();
@@ -1379,14 +1561,23 @@ if (vk == VK_RETURN) {
 CopyInputToClipboardAndClear();
 handled = true;
 } else if (vk == 'V' && IsControlDown()) {
-g_pasteStatus.store(PasteClipboardIp() ? 1 : 2);
-handled = true;
+    g_pasteStatus.store(PasteClipboardIp() ? 1 : 2);
+    handled = true;
 } else if (IsControlDown()) {
-// Do not interpret modified shortcuts as IP characters.
-continue;
+    // Do not reinterpret Ctrl-based shortcuts as text/caret movement.
+    continue;
+} else if (vk == VK_LEFT) {
+    MoveIpCursorLeft();
+    handled = true;
+} else if (vk == VK_RIGHT) {
+    MoveIpCursorRight();
+    handled = true;
 } else if (vk == VK_BACK) {
-RemoveLastIpCharacter();
-handled = true;
+    RemoveIpCharacterBeforeCursor();
+    handled = true;
+} else if (vk == VK_DELETE) {
+    RemoveIpCharacterAtCursor();
+    handled = true;
 } else {
 KBDLLHOOKSTRUCT key{};
 key.vkCode = vk;
@@ -1508,7 +1699,11 @@ DWORD WINAPI OverlayThread(void*)
 
         if ((IsNormalInfoScene(currentScene) || currentScene == 12 || currentScene == 15) &&
             now - g_lastPageFlip >= std::chrono::seconds(1)) {
-            g_displayPage = 1 - g_displayPage;
+            if (CanFlipToSecondaryPage(currentScene)) {
+                g_displayPage = 1 - g_displayPage;
+            } else {
+                g_displayPage = 0;
+            }
             g_lastPageFlip = now;
             UpdateInfoText();
         }
@@ -1569,7 +1764,7 @@ DWORD WINAPI OverlayThread(void*)
             (g_infoLines.empty() || now - g_lastCharacterRefresh >= std::chrono::seconds(1))) {
             const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
             const std::string opponent = ReadProfile(offset);
-            if (!opponent.empty() && opponent != g_opponentProfile) {
+            if (opponent != g_opponentProfile) {
                 g_opponentProfile = opponent;
                 g_normalStats = {};
                 g_normalStatsValid = false;
