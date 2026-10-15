@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -46,8 +47,19 @@ volatile LONG g_stopRequested = 0;
 std::atomic<int> g_sceneId{-1};
 bool g_clientMode = false;
 std::atomic<bool> g_overlayEnabled{true};
+// Tracks the configurable overlay-toggle key and F10 separately. F10 has
+// scene-specific actions (title history / reversal counter) that must not
+// also toggle the normal statistics panel.
 bool g_previousAsyncF10Down = false;
+bool g_previousF10Down = false;
 bool g_overlayManuallyDisabledForSession = false;
+int g_displayPage = 0;
+bool g_titleHistoryVisible = false;
+std::vector<std::wstring> g_titleHistoryLines;
+int g_reversalCounterCount = 0;
+bool g_reversalCounterVisible = false;
+std::wstring g_reversalCounterStatus;
+std::vector<std::wstring> g_reversalCounterHistory;
 bool g_tskRunning = false;
 enum class TskWarningState { None, NotRunning, GameNotDetected };
 TskWarningState g_tskWarningState = TskWarningState::None;
@@ -97,11 +109,16 @@ Clock::time_point g_lastWarningBlink{};
 Clock::time_point g_lastCharacterRefresh{};
 Clock::time_point g_lastWindowSearch{};
 Clock::time_point g_lastKeyboardHookCheck{};
+Clock::time_point g_lastPageFlip{};
 
 static int (SokuLib::BattleManager::*g_originalBattleManagerOnProcess)() = nullptr;
 
 void UpdateInputText();
 void UpdateInfoText();
+std::wstring CharacterName(int id);
+std::wstring RateText(int wins, int losses);
+void RefreshTitleHistory();
+void RegisterReversalCounter();
 
 bool IsFileTimeEqual(const FILETIME& a, const FILETIME& b)
 {
@@ -119,6 +136,21 @@ const size_t slash = path.find_last_of(L"\\/");
 if (slash == std::wstring::npos)
 return {};
 return path.substr(0, slash);
+}
+
+// Returns the directory containing this module (not th123.exe). RLcounter.txt
+// intentionally lives beside OIOverlay.dll, matching the requested install layout.
+std::wstring OverlayModuleDirectory()
+{
+    wchar_t fullPath[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(g_module, fullPath, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+        return {};
+    const std::wstring path(fullPath, length);
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return {};
+    return path.substr(0, slash);
 }
 
 bool FileExists(const std::wstring& path)
@@ -254,6 +286,98 @@ std::wstring FormatDate(const std::string& value)
 return NarrowAsciiToWide(value);
 }
 
+std::wstring ShortRunDate(const std::string& value)
+{
+    int year = 0, month = 0, day = 0;
+    if (sscanf_s(value.c_str(), "%d/%d/%d", &year, &month, &day) == 3 ||
+        sscanf_s(value.c_str(), "%d-%d-%d", &year, &month, &day) == 3) {
+        return std::to_wstring(month) + L"/" + std::to_wstring(day);
+    }
+    return value.empty() ? L"--/--" : NarrowAsciiToWide(value);
+}
+
+std::wstring RunLine(const TskRunStats& run, bool includeProfile)
+{
+    std::wostringstream out;
+    out << ShortRunDate(run.endDateText) << L"　";
+    if (includeProfile)
+        out << ProfileDisplayName(run.profileNameCp932) << L"　";
+    out << std::setw(2) << run.wins << L"勝 "
+        << std::setw(3) << run.losses << L"敗　("
+        << RateText(run.wins, run.losses) << L")";
+    return out.str();
+}
+
+std::wstring MainCharacterRecordLine(const TskStats& stats)
+{
+    std::wostringstream out;
+    out << CharacterName(stats.mainCharacterId) << L"　"
+        << std::setw(2) << stats.mainCharacterWins << L"勝 "
+        << std::setw(3) << stats.mainCharacterLosses << L"敗　("
+        << RateText(stats.mainCharacterWins, stats.mainCharacterLosses) << L")";
+    return out.str();
+}
+
+std::string WideToUtf8String(const std::wstring& value)
+{
+    if (value.empty())
+        return {};
+    const int required = WideCharToMultiByte(CP_UTF8, 0, value.data(),
+        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (required <= 0)
+        return {};
+    std::string result(static_cast<size_t>(required), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+        &result[0], required, nullptr, nullptr) != required)
+        return {};
+    return result;
+}
+
+std::wstring CurrentCounterTimestamp()
+{
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    std::wostringstream out;
+    out << now.wYear << L"/" << now.wMonth << L"/" << now.wDay << L"_"
+        << std::setfill(L'0') << std::setw(2) << now.wHour << L":"
+        << std::setw(2) << now.wMinute << L":"
+        << std::setw(2) << now.wSecond;
+    return out.str();
+}
+
+bool AppendCounterText(const std::wstring& line)
+{
+    const std::wstring directory = OverlayModuleDirectory();
+    if (directory.empty())
+        return false;
+    const std::wstring path = directory + L"\\RLcounter.txt";
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER size{};
+    const bool gotSize = GetFileSizeEx(file, &size) != FALSE;
+    bool ok = gotSize;
+    if (ok && size.QuadPart == 0) {
+        static const BYTE utf8Bom[] = { 0xEF, 0xBB, 0xBF };
+        DWORD written = 0;
+        ok = WriteFile(file, utf8Bom, sizeof(utf8Bom), &written, nullptr) != FALSE &&
+            written == sizeof(utf8Bom);
+    }
+    if (ok) {
+        const std::string utf8 = WideToUtf8String(line + L"\r\n");
+        DWORD written = 0;
+        ok = !utf8.empty() && WriteFile(file, utf8.data(),
+            static_cast<DWORD>(utf8.size()), &written, nullptr) != FALSE &&
+            written == utf8.size();
+    }
+    CloseHandle(file);
+    return ok;
+}
+
+
 std::wstring CharacterName(int id)
 {
 switch (id) {
@@ -283,12 +407,19 @@ default: return L"---";
 
 std::wstring RateText(int wins, int losses)
 {
-if (wins + losses <= 0)
-return L"---.-%";
-std::wostringstream out;
-out << std::fixed << std::setprecision(1)
-<< (100.0 * wins / (wins + losses)) << L"%";
-return out.str();
+std::wstring rate;
+if (wins + losses <= 0) {
+    rate = L"---.-%";
+} else {
+    std::wostringstream out;
+    out << std::fixed << std::setprecision(1)
+        << (100.0 * wins / (wins + losses)) << L"%";
+    rate = out.str();
+}
+// Keep the percentage column aligned with the no-record marker (---.-%).
+if (rate.size() < 6)
+    rate.insert(rate.begin(), 6 - rate.size(), L' ');
+return rate;
 }
 
 std::wstring RecordLine(const wchar_t* label, int ourWins, int theirWins)
@@ -401,6 +532,61 @@ if (r1.size() < 6) r1.insert(r1.begin(), 6 - r1.size(), L' ');
 if (r2.size() < 6) r2.insert(r2.begin(), 6 - r2.size(), L' ');
 text += r1 + L" /" + r2 + L" ： 過去1か月";
 return text;
+}
+
+std::wstring BuildNormalSecondaryInfo()
+{
+    std::wstring text = L"【メインキャラ限定 / 連戦履歴】\n\n";
+    if (g_opponentProfile.empty())
+        return text + L"対戦相手を取得中...";
+    if (!g_normalStatsValid || !g_normalStats.found)
+        return text + L"対戦記録がありません";
+
+    const TskStats& stats = g_normalStats;
+    text += MainCharacterRecordLine(stats) + L"\n\n";
+    if (stats.recentRuns.empty()) {
+        text += L"連戦履歴なし";
+    } else {
+        for (size_t i = 0; i < stats.recentRuns.size(); ++i) {
+            text += RunLine(stats.recentRuns[i], false);
+            if (i + 1 < stats.recentRuns.size())
+                text += L"\n";
+        }
+    }
+    return text;
+}
+
+void AppendWatchingSecondaryPlayer(
+    std::wstring& text,
+    const wchar_t* label,
+    const TskStats& stats,
+    bool statsValid)
+{
+    text += std::wstring(label) + L" ";
+    if (!statsValid || !stats.found) {
+        text += L"対戦記録がありません\n";
+        return;
+    }
+    text += MainCharacterRecordLine(stats) + L"\n";
+    if (stats.recentRuns.empty()) {
+        text += L"  連戦履歴なし\n";
+        return;
+    }
+    for (size_t i = 0; i < stats.recentRuns.size(); ++i) {
+        text += L"  " + RunLine(stats.recentRuns[i], false);
+        text += L"\n";
+    }
+}
+
+std::wstring BuildWatchingSecondaryInfo()
+{
+    std::wstring text = L"【観戦中：メインキャラ限定 / 連戦履歴】\n\n";
+    if (g_watchingP1Profile.empty() || g_watchingP2Profile.empty())
+        return text + L"1P / 2Pのプロファイルを取得中...";
+    AppendWatchingSecondaryPlayer(text, L"1P", g_watchP1Stats, g_watchP1StatsValid);
+    text += L"\n";
+    AppendWatchingSecondaryPlayer(text, L"2P", g_watchP2Stats, g_watchP2StatsValid);
+    return text;
 }
 
 void SplitLines(const std::wstring& text, std::vector<std::wstring>& out)
@@ -783,6 +969,20 @@ return false;
 const int oldScene = g_sceneId;
 g_sceneId = scene;
 
+    if (scene <= 7) {
+        g_displayPage = 0;
+        g_titleHistoryVisible = false;
+        g_titleHistoryLines.clear();
+    } else if (IsNormalInfoScene(scene) || scene == 12 || scene == 15) {
+        g_displayPage = 0;
+        g_lastPageFlip = Clock::now();
+        g_titleHistoryVisible = false;
+        g_titleHistoryLines.clear();
+    } else if (scene != 2) {
+        g_titleHistoryVisible = false;
+        g_titleHistoryLines.clear();
+    }
+
     // A new character-select / spectator-loading session starts enabled by default.
     // Once F10 disables the overlay, keep it disabled until the game returns to SceneID <= 7.
     if (scene <= 7) {
@@ -850,9 +1050,9 @@ void UpdateInfoText()
     std::vector<std::wstring> next;
     if (g_overlayEnabled) {
         if (IsNormalInfoScene(g_sceneId))
-            SplitLines(BuildNormalInfo(), next);
+            SplitLines(g_displayPage == 0 ? BuildNormalInfo() : BuildNormalSecondaryInfo(), next);
         else if (g_sceneId == 12 || g_sceneId == 15)
-            SplitLines(BuildWatchingInfo(), next);
+            SplitLines(g_displayPage == 0 ? BuildWatchingInfo() : BuildWatchingSecondaryInfo(), next);
     }
     if (next != g_infoLines)
         g_infoLines = std::move(next);
@@ -878,12 +1078,16 @@ void UpdateInputText()
 struct RenderSnapshot
 {
     std::vector<std::wstring> infoLines;
+    std::vector<std::wstring> titleHistoryLines;
+    std::vector<std::wstring> reversalCounterLines;
     std::wstring inputLine;
     int sceneId = -1;
     int warningState = 0;
     bool overlayEnabled = true;
     bool inputVisible = false;
     bool warningBlink = false;
+    bool titleHistoryVisible = false;
+    bool reversalCounterVisible = false;
 };
 
 std::mutex g_renderSnapshotMutex;
@@ -893,6 +1097,16 @@ void PublishRenderSnapshot()
 {
     RenderSnapshot next;
     next.infoLines = g_infoLines;
+    next.titleHistoryLines = g_titleHistoryLines;
+    next.titleHistoryVisible = g_titleHistoryVisible;
+    next.reversalCounterVisible = g_reversalCounterVisible;
+    next.reversalCounterLines.push_back(L"リバサルミネスカウンター : " + std::to_wstring(g_reversalCounterCount));
+    if (!g_reversalCounterStatus.empty())
+        next.reversalCounterLines.push_back(g_reversalCounterStatus);
+    const size_t reversalFirst = g_reversalCounterHistory.size() > 5
+        ? g_reversalCounterHistory.size() - 5 : 0;
+    for (size_t i = g_reversalCounterHistory.size(); i > reversalFirst; --i)
+        next.reversalCounterLines.push_back(g_reversalCounterHistory[i - 1]);
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
         next.inputLine = g_inputLine;
@@ -936,7 +1150,7 @@ void AddPanel(ImDrawList* draw, const ImVec2& min, const ImVec2& max,
 }
 
 void DrawInfoPanel(ImDrawList* draw, int screenWidth, int screenHeight,
-    const std::vector<std::wstring>& sourceLines)
+    const std::vector<std::wstring>& sourceLines, bool alignTop = false)
 {
     if (sourceLines.empty() || screenWidth <= 24 || screenHeight <= 24)
         return;
@@ -972,7 +1186,9 @@ void DrawInfoPanel(ImDrawList* draw, int screenWidth, int screenHeight,
     }
     const float panelHeight = contentHeight + 12.0f;
     const float left = 12.0f;
-    const float top = (std::max)(8.0f, (static_cast<float>(screenHeight) - panelHeight) / 2.0f);
+    const float top = alignTop
+        ? 12.0f
+        : (std::max)(8.0f, (static_cast<float>(screenHeight) - panelHeight) / 2.0f);
 
     // The near-black fill at alpha 165/255 looked too opaque in-game.
     // Lower alpha leaves more of the match visible while retaining readable text.
@@ -1068,11 +1284,67 @@ void RenderGameUi(int screenWidth, int screenHeight)
         return;
 
     // Render in this order so the TSK warning remains visible above the other panels.
-    if (snapshot.overlayEnabled)
+    if (snapshot.titleHistoryVisible && snapshot.sceneId == 2) {
+        DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.titleHistoryLines, true);
+    } else if (snapshot.overlayEnabled) {
         DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.infoLines);
+    }
+    if (snapshot.reversalCounterVisible && (snapshot.sceneId == 13 || snapshot.sceneId == 14))
+        DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.reversalCounterLines, true);
     if (snapshot.inputVisible)
         DrawInputPanel(draw, screenWidth, screenHeight, snapshot.inputLine);
     DrawWarningPanel(draw, screenWidth, screenHeight, snapshot.warningState, snapshot.warningBlink);
+}
+
+void RefreshTitleHistory()
+{
+    std::vector<std::wstring> lines;
+    lines.push_back(L"【連戦履歴：直近10回】");
+    if (!g_database || !g_database->IsAvailable()) {
+        lines.push_back(L"天則観の対戦記録を読み込めません");
+        g_titleHistoryLines = std::move(lines);
+        return;
+    }
+
+    std::vector<TskRunStats> runs;
+    if (!g_database->GetRecentRuns(10, 30, runs)) {
+        lines.push_back(L"連戦履歴の読み込みに失敗しました");
+    } else if (runs.empty()) {
+        lines.push_back(L"表示できる連戦履歴がありません");
+    } else {
+        for (const auto& run : runs)
+            lines.push_back(RunLine(run, true));
+    }
+    g_titleHistoryLines = std::move(lines);
+}
+
+void RegisterReversalCounter()
+{
+    if (g_sceneId != 13 && g_sceneId != 14)
+        return;
+
+    const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
+    std::string opponent = ReadProfile(offset);
+    if (opponent.empty())
+        opponent = g_opponentProfile;
+    if (opponent.empty())
+        opponent = "";
+
+    std::wstring opponentWide = opponent.empty() ? L"不明" : Cp932ToWide(opponent);
+    const std::wstring line = CurrentCounterTimestamp() + L"_[" + opponentWide + L"]";
+    g_reversalCounterVisible = true;
+    g_reversalCounterStatus.clear();
+
+    if (!AppendCounterText(line)) {
+        g_reversalCounterStatus = L"RLcounter.txt への保存に失敗しました";
+        OutputDebugStringW(L"[OIOverlay] Failed to append RLcounter.txt next to the module.\n");
+        return;
+    }
+
+    ++g_reversalCounterCount;
+    g_reversalCounterHistory.push_back(line);
+    if (g_reversalCounterHistory.size() > 50)
+        g_reversalCounterHistory.erase(g_reversalCounterHistory.begin(), g_reversalCounterHistory.end() - 50);
 }
 
 void PollIpInputFromGameFrame()
@@ -1194,6 +1466,7 @@ DWORD WINAPI OverlayThread(void*)
     g_lastDbCheck = Clock::now();
     g_lastWarningBlink = Clock::now();
     g_lastCharacterRefresh = Clock::now();
+    g_lastPageFlip = Clock::now();
     g_lastWindowSearch = Clock::time_point{};
 
     PublishRenderSnapshot();
@@ -1201,18 +1474,44 @@ DWORD WINAPI OverlayThread(void*)
     while (InterlockedCompareExchange(&g_stopRequested, 0, 0) == 0) {
         const auto now = Clock::now();
 
-        // Toggle key is polled outside the BattleManager hook so character-select
-        // and spectator-loading scenes keep responding. SceneID <= 7 re-arms default.
+        // Poll keys outside the BattleManager hook, so this still works in the
+        // title/menu and full-screen battle scenes. F10 has dedicated actions on
+        // SceneID 2 and 13/14; those actions must not also toggle the info panel.
         const bool toggleDown = g_config.toggleKey != 0 &&
             (GetAsyncKeyState(static_cast<int>(g_config.toggleKey)) & 0x8000) != 0;
-        if (g_sceneId.load() > 7 && IsGameForeground() && toggleDown && !g_previousAsyncF10Down) {
+        const bool togglePressed = toggleDown && !g_previousAsyncF10Down;
+        const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        const bool f10Pressed = f10Down && !g_previousF10Down;
+        const int currentScene = g_sceneId.load();
+        const bool gameForeground = IsGameForeground();
+
+        if (gameForeground && f10Pressed && currentScene == 2) {
+            g_titleHistoryVisible = !g_titleHistoryVisible;
+            if (g_titleHistoryVisible)
+                RefreshTitleHistory();
+        } else if (gameForeground && f10Pressed && (currentScene == 13 || currentScene == 14)) {
+            RegisterReversalCounter();
+        } else if (gameForeground && togglePressed && currentScene > 7 &&
+            currentScene != 13 && currentScene != 14 && currentScene != 2) {
             const bool enable = !g_overlayEnabled.load();
             g_overlayEnabled.store(enable);
             if (!enable)
                 g_overlayManuallyDisabledForSession = true;
+            else {
+                g_displayPage = 0;
+                g_lastPageFlip = now;
+            }
             UpdateInfoText();
         }
         g_previousAsyncF10Down = toggleDown;
+        g_previousF10Down = f10Down;
+
+        if ((IsNormalInfoScene(currentScene) || currentScene == 12 || currentScene == 15) &&
+            now - g_lastPageFlip >= std::chrono::seconds(1)) {
+            g_displayPage = 1 - g_displayPage;
+            g_lastPageFlip = now;
+            UpdateInfoText();
+        }
 
         if (now - g_lastWindowSearch >= std::chrono::milliseconds(250) || !g_gameWindow) {
             HWND found = FindGameWindow();

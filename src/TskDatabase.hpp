@@ -28,6 +28,14 @@ struct TskPeriodStats {
     double WinRate() const;
 };
 
+struct TskRunStats {
+    std::string profileNameCp932;
+    std::string endDateText;
+    long long endEpochSeconds = 0;
+    int wins = 0;   // P1 wins, matching OIV PlayerStatisticsForm.cs
+    int losses = 0; // P2 wins, matching OIV PlayerStatisticsForm.cs
+};
+
 struct TskStats {
     bool found = false;
 
@@ -43,6 +51,9 @@ struct TskStats {
 
     int mainCharacterId = -1;
     int mainCharacterMatches = 0;
+    int mainCharacterWins = 0;
+    int mainCharacterLosses = 0;
+    std::vector<TskRunStats> recentRuns;
 
     std::string firstMatchDate;
     std::string lastMatchDateBeforeToday;
@@ -79,6 +90,15 @@ public:
     bool GetOpponentStats(
         const std::vector<std::string>& profilesCp932,
         TskStats& stats
+    ) const;
+
+    // Reads the global OIV-style consecutive-profile table. Consecutive rows
+    // with the same P2 profile form one run; the newest run is omitted when
+    // its last record is within excludeLatestMinutes, as it may still be active.
+    bool GetRecentRuns(
+        int maxRuns,
+        int excludeLatestMinutes,
+        std::vector<TskRunStats>& runs
     ) const;
 
 private:

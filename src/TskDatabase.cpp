@@ -90,17 +90,6 @@ std::string FormatEpochForDisplay(long long epochSeconds, bool oivFileTimeShift)
     return buffer;
 }
 
-bool EqualCp932Blob(
-    sqlite3_stmt* stmt,
-    int column,
-    const std::string& target
-)
-{
-    std::string actual =
-        BlobToString(stmt, column);
-
-    return actual == target;
-}
 
 bool IsLeap(int year)
 {
@@ -477,6 +466,7 @@ TskMatchRecord ReadRecord(
             record.timestampText = display;
     }
 
+
     record.p1NameCp932 =
         BlobToString(stmt, 1);
 
@@ -512,6 +502,106 @@ void AddPeriodResult(
     if (record.p1Rounds >= 2) {
         stats.losses++;
     }
+}
+
+bool EarlierRecord(const TskMatchRecord& a, const TskMatchRecord& b)
+{
+    if (a.hasParsedTimestamp && b.hasParsedTimestamp)
+        return a.timestampKey < b.timestampKey;
+    return a.timestampText < b.timestampText;
+}
+
+void SortRecords(std::vector<TskMatchRecord>& records)
+{
+    std::sort(records.begin(), records.end(), EarlierRecord);
+}
+
+std::string NormalizeProfileName(const std::string& value)
+{
+    // Match PlayerStatisticsForm.NormalizeProfile(): trim surrounding whitespace.
+    size_t first = 0;
+    size_t last = value.size();
+    const auto isTrimSpace = [](unsigned char ch) {
+        return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+    };
+    while (first < last && isTrimSpace(static_cast<unsigned char>(value[first])))
+        ++first;
+    while (last > first && isTrimSpace(static_cast<unsigned char>(value[last - 1])))
+        --last;
+    return value.substr(first, last - first);
+}
+
+bool ContainsProfile(const std::vector<std::string>& profiles, const std::string& value)
+{
+    const std::string normalizedValue = NormalizeProfileName(value);
+    return std::any_of(profiles.begin(), profiles.end(), [&](const std::string& candidate) {
+        return NormalizeProfileName(candidate) == normalizedValue;
+    });
+}
+
+void BuildOivRuns(
+    const std::vector<TskMatchRecord>& allRecords,
+    const std::vector<std::string>& profilesFilter,
+    int maxRuns,
+    int excludeLatestMinutes,
+    std::vector<TskRunStats>& output)
+{
+    output.clear();
+    if (allRecords.empty() || maxRuns <= 0)
+        return;
+
+    std::vector<TskRunStats> allRuns;
+    allRuns.reserve((std::min)(allRecords.size(), static_cast<size_t>(512)));
+    TskRunStats current{};
+    bool hasCurrent = false;
+
+    // Keep the same session boundary as PlayerStatisticsForm.BuildRecentRuns:
+    // a run ends only when the P2 profile name changes, not when the date or
+    // the elapsed time changes.
+    for (const auto& record : allRecords) {
+        const std::string normalizedProfile = NormalizeProfileName(record.p2NameCp932);
+        if (!hasCurrent || current.profileNameCp932 != normalizedProfile) {
+            if (hasCurrent)
+                allRuns.push_back(current);
+            current = {};
+            current.profileNameCp932 = normalizedProfile;
+            hasCurrent = true;
+        }
+
+        current.endDateText = record.timestampText;
+        // Use the stored absolute timestamp for the 30-minute freshness check.
+        // The display text intentionally follows OIV's presentation format,
+        // while the freshness check must compare absolute timestamps.
+        current.endEpochSeconds = record.epochSeconds;
+        // OIV treats P1 as the viewer and P2 as the opponent.
+        if (record.p1Rounds >= 2)
+            ++current.wins;
+        else if (record.p2Rounds >= 2)
+            ++current.losses;
+    }
+    if (hasCurrent)
+        allRuns.push_back(current);
+
+    // OIV places newest runs first. Filter only after creating global runs so
+    // matches from other profiles still split a run exactly as the player table does.
+    std::vector<TskRunStats> matching;
+    matching.reserve(allRuns.size());
+    for (auto it = allRuns.rbegin(); it != allRuns.rend(); ++it) {
+        if (profilesFilter.empty() || ContainsProfile(profilesFilter, it->profileNameCp932))
+            matching.push_back(*it);
+    }
+
+    // Do not display a likely ongoing final run. Compare the source timestamp
+    // as an absolute epoch; the string shown in the UI follows OIV's -9-hour
+    // display adjustment for FILETIME records and must not be used for age.
+    if (!matching.empty() && excludeLatestMinutes > 0 && matching.front().endEpochSeconds > 0) {
+        const long long age = NowEpochSeconds() - matching.front().endEpochSeconds;
+        if (age >= 0 && age <= static_cast<long long>(excludeLatestMinutes) * 60LL)
+            matching.erase(matching.begin());
+    }
+
+    const size_t count = (std::min)(matching.size(), static_cast<size_t>(maxRuns));
+    output.assign(matching.begin(), matching.begin() + count);
 }
 
 }
@@ -646,34 +736,26 @@ bool TskDatabase::GetOpponentStats(
         return false;
     }
 
-    std::vector<TskMatchRecord> records;
+    std::vector<TskMatchRecord> allRecords;
 
-    while (
-        sqlite3_step(stmt) ==
-        SQLITE_ROW
-    ) {
-
-        /*
-         * OIViewerと同じく、
-         * P2プロファイルとして検索する。
-         */
-        bool profileMatched = false;
-        for (const auto& candidateProfile : profilesCp932) {
-            if (!candidateProfile.empty() && EqualCp932Blob(stmt, 4, candidateProfile)) {
-                profileMatched = true;
-                break;
-            }
-        }
-        if (!profileMatched)
-            continue;
-
-        records.push_back(
-            ReadRecord(stmt)
-        );
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        allRecords.push_back(ReadRecord(stmt));
     }
 
     sqlite3_finalize(stmt);
     sqlite3_close(db);
+
+    SortRecords(allRecords);
+
+    // Per-opponent totals use the same set of profile aliases as before,
+    // while the OIV run grouping must see all profiles before filtering.
+    std::vector<TskMatchRecord> records;
+    records.reserve(allRecords.size());
+    for (const auto& record : allRecords) {
+        if (ContainsProfile(profilesCp932, record.p2NameCp932))
+            records.push_back(record);
+    }
+    BuildOivRuns(allRecords, profilesCp932, 5, 30, stats.recentRuns);
 
     if (records.empty()) {
         stats.found = false;
@@ -682,25 +764,7 @@ bool TskDatabase::GetOpponentStats(
 
     stats.found = true;
 
-    std::sort(
-        records.begin(),
-        records.end(),
-        [](const TskMatchRecord& a,
-           const TskMatchRecord& b) {
-
-            if (a.hasParsedTimestamp &&
-                b.hasParsedTimestamp) {
-
-                return
-                    a.timestampKey <
-                    b.timestampKey;
-            }
-
-            return
-                a.timestampText <
-                b.timestampText;
-        }
-    );
+    SortRecords(records);
 
     stats.totalMatches =
         static_cast<int>(records.size());
@@ -877,6 +941,20 @@ bool TskDatabase::GetOpponentStats(
         }
     }
 
+    // Main-character-only record from the viewer's perspective (P1 wins / P2 losses).
+    // The main character is selected from the same recent-100 window above,
+    // while the win/loss totals use all available records for that character.
+    if (stats.mainCharacterId >= 0) {
+        for (const auto& record : records) {
+            if (record.p2CharacterId != stats.mainCharacterId)
+                continue;
+            if (record.p1Rounds >= 2)
+                ++stats.mainCharacterWins;
+            else if (record.p2Rounds >= 2)
+                ++stats.mainCharacterLosses;
+        }
+    }
+
     /*
      * OIViewerの既存互換判定。
      */
@@ -899,6 +977,54 @@ bool TskDatabase::GetOpponentStats(
     return true;
 }
 
+
+bool TskDatabase::GetRecentRuns(
+    int maxRuns,
+    int excludeLatestMinutes,
+    std::vector<TskRunStats>& runs
+) const
+{
+    runs.clear();
+    if (maxRuns <= 0 || !IsAvailable())
+        return false;
+
+    const std::string dbPathUtf8 = WideToUtf8(dbPath);
+    if (dbPathUtf8.empty())
+        return false;
+
+    sqlite3* db = nullptr;
+    const int rc = sqlite3_open_v2(
+        dbPathUtf8.c_str(), &db,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
+    if (rc != SQLITE_OK || db == nullptr) {
+        if (db)
+            sqlite3_close(db);
+        return false;
+    }
+    sqlite3_busy_timeout(db, 200);
+
+    static constexpr char sql[] =
+        "SELECT timestamp, CAST(p1name AS BLOB), p1id, p1win, "
+        "CAST(p2name AS BLOB), p2id, p2win "
+        "FROM trackrecord123 ORDER BY timestamp ASC";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK || !stmt) {
+        if (stmt)
+            sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return false;
+    }
+
+    std::vector<TskMatchRecord> allRecords;
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+        allRecords.push_back(ReadRecord(stmt));
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    SortRecords(allRecords);
+    BuildOivRuns(allRecords, {}, maxRuns, excludeLatestMinutes, runs);
+    return true;
+}
 
 const char* GetCharacterNameUtf8(int id)
 {

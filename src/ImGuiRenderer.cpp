@@ -528,12 +528,20 @@ bool InitializeImGuiForDevice(IDirect3DDevice9* device)
     const std::string gothicPath = WindowsFontPathUtf8(L"msgothic.ttc");
     const std::string meiryoPath = WindowsFontPathUtf8(L"meiryo.ttc");
 
-    // The built-in Japanese range is curated and may omit uncommon kanji used
-    // in game character names. U+8403 is 萃; include it explicitly so ImGui
-    // does not substitute '?' even though the source string is correct.
+    // The built-in Japanese range is curated and omits some uncommon kanji
+    // used in player/profile names (for example 狐 and 萃). Keep the standard
+    // Japanese ranges, then include the BMP CJK unified/extension/compatibility
+    // blocks so names that are valid CP932 text do not become '?' just because
+    // the ImGui atlas did not include their glyphs.
     ImFontGlyphRangesBuilder rangeBuilder;
     rangeBuilder.AddRanges(io.Fonts->GetGlyphRangesJapanese());
-    rangeBuilder.AddChar(static_cast<ImWchar>(0x8403));
+    static const ImWchar extraCjkRanges[] = {
+        0x3400, 0x4DBF, // CJK Unified Ideographs Extension A
+        0x4E00, 0x9FFF, // CJK Unified Ideographs
+        0xF900, 0xFAFF, // CJK Compatibility Ideographs
+        0
+    };
+    rangeBuilder.AddRanges(extraCjkRanges);
     rangeBuilder.BuildRanges(&g_uiGlyphRanges);
 
     ImFontConfig fontConfig{};
