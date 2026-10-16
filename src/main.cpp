@@ -58,7 +58,9 @@ int g_displayPage = 0;
 bool g_titleHistoryVisible = false;
 std::vector<std::wstring> g_titleHistoryLines;
 int g_reversalCounterCount = 0;
-bool g_reversalCounterLiveVisible = false;
+// True from the first observed SceneID 8..14 until the game returns to <= 7.
+// This is independent of whether the user has pressed F10, so zero-count runs are saved too.
+bool g_reversalCounterRunActive = false;
 bool g_reversalCounterSummaryVisible = false;
 int g_reversalCounterSummaryCount = 0;
 std::wstring g_reversalCounterStatus;
@@ -357,6 +359,18 @@ std::wstring CurrentCounterTimestamp()
     return out.str();
 }
 
+std::wstring CurrentRunSummaryLine(int count, const std::wstring& opponentName)
+{
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    std::wostringstream out;
+    out << std::setfill(L'0') << std::setw(4) << now.wYear << L"/"
+        << std::setw(2) << now.wMonth << L"/" << std::setw(2) << now.wDay
+        << L"_RL: " << count << L"_["
+        << (opponentName.empty() ? L"不明" : opponentName) << L"]";
+    return out.str();
+}
+
 bool AppendCounterText(const std::wstring& line)
 {
     const std::wstring directory = OverlayModuleDirectory();
@@ -479,6 +493,17 @@ return text;
 bool IsNormalInfoScene(int scene)
 {
 return scene >= 8 && scene <= 11;
+}
+
+bool IsReversalCounterSeriesScene(int scene)
+{
+return scene >= 8 && scene <= 14;
+}
+
+bool IsReversalCounterDisplayScene(int scene)
+{
+return scene == 8 || scene == 9 || scene == 10 || scene == 11 ||
+    scene == 13 || scene == 14;
 }
 
 std::wstring BuildNormalInfo()
@@ -1047,29 +1072,39 @@ g_sceneId = scene;
 {
     std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
     // A double-tap can only mark a clip while still in the same match scene.
-    // Keep the delayed confirmation alive when leaving battle, but don't allow a
-    // title/menu F10 or a new match to consume the previous match's pending tap.
+    // Keep delayed confirmation alive when leaving battle, but don't let a later
+    // title/menu F10 or another series consume the previous tap.
     const bool oldWasBattleScene = (oldScene == 13 || oldScene == 14);
     const bool newBattleScene = (scene == 13 || scene == 14);
     if (oldWasBattleScene && !newBattleScene && g_reversalCounterPending)
         g_reversalCounterPendingClipEligible = false;
 
-    // Keep the counter through round transitions until SceneID returns to <= 7.
-    // Once finalized, retain the large result until a new battle (13/14) starts.
-    if (scene <= 7 && oldScene > 7 && g_reversalCounterLiveVisible) {
+    // SceneID <= 7 ends the active series. Finalize and append exactly once,
+    // regardless of the count (including zero) or whether RL was displayed before.
+    if (scene <= 7 && g_reversalCounterRunActive) {
         g_reversalCounterSummaryCount = g_reversalCounterCount;
         g_reversalCounterSummaryVisible = true;
-        g_reversalCounterLiveVisible = false;
+
+        std::string opponent = g_opponentProfile;
+        if (opponent.empty()) {
+            const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
+            opponent = ReadProfile(offset);
+        }
+        const std::wstring opponentWide = opponent.empty() ? L"不明" : Cp932ToWide(opponent);
+        if (!AppendCounterText(CurrentRunSummaryLine(g_reversalCounterSummaryCount, opponentWide))) {
+            OutputDebugStringW(L"[OIOverlay] Failed to append series summary to RLcounter.txt.\n");
+        }
+        g_reversalCounterRunActive = false;
     }
-    // Reset for every new match even when the user has manually hidden the summary.
-    // A pending count from the previous match remains scheduled for sound confirmation,
-    // but becomes ineligible for a clip marker as set above.
-    if (newBattleScene && !oldWasBattleScene && (g_reversalCounterSummaryVisible ||
-        g_reversalCounterCount != 0 || g_reversalCounterSummaryCount != 0)) {
+
+    // The first observed SceneID 8..14 starts a new series. Reset here rather
+    // than on 13/14 transitions, because the counter must survive all transitions
+    // within the same 8..14 sequence.
+    if (IsReversalCounterSeriesScene(scene) && !g_reversalCounterRunActive) {
+        g_reversalCounterRunActive = true;
         g_reversalCounterCount = 0;
         g_reversalCounterSummaryCount = 0;
         g_reversalCounterSummaryVisible = false;
-        g_reversalCounterLiveVisible = false;
         g_reversalCounterStatus.clear();
         if (g_reversalCounterPending)
             g_reversalCounterPendingClipEligible = false;
@@ -1147,6 +1182,13 @@ g_cachedNormalProfile.clear();
 }
 if (oldScene <= 7 && opponent.empty())
 g_opponentProfile.clear();
+} else if (scene == 13 || scene == 14) {
+// Usually the opponent was captured in SceneID 8..11; refresh it here too
+// so the end-of-series log still has a name if those scenes were skipped.
+const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
+const std::string opponent = ReadProfile(offset);
+if (!opponent.empty())
+g_opponentProfile = opponent;
 }
 
 return true;
@@ -1212,7 +1254,6 @@ struct RenderSnapshot
     bool inputVisible = false;
     bool warningBlink = false;
     bool titleHistoryVisible = false;
-    bool secondaryInfoPage = false;
     bool reversalCounterLiveVisible = false;
     bool reversalCounterSummaryVisible = false;
     int reversalCounterCount = 0;
@@ -1226,6 +1267,7 @@ RenderSnapshot g_renderSnapshot;
 void PublishRenderSnapshot()
 {
     RenderSnapshot next;
+    next.sceneId = g_sceneId.load();
     next.infoLines = g_infoLines;
     if (g_overlayEnabled && (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15)) {
         std::vector<std::wstring> alternate;
@@ -1237,10 +1279,9 @@ void PublishRenderSnapshot()
     }
     next.titleHistoryLines = g_titleHistoryLines;
     next.titleHistoryVisible = g_titleHistoryVisible;
-    next.secondaryInfoPage = g_displayPage != 0;
     {
         std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
-        next.reversalCounterLiveVisible = g_reversalCounterLiveVisible;
+        next.reversalCounterLiveVisible = IsReversalCounterDisplayScene(next.sceneId);
         next.reversalCounterSummaryVisible = g_reversalCounterSummaryVisible;
         next.reversalCounterCount = g_reversalCounterCount;
         next.reversalCounterSummaryCount = g_reversalCounterSummaryCount;
@@ -1250,7 +1291,6 @@ void PublishRenderSnapshot()
         std::lock_guard<std::mutex> lock(g_inputMutex);
         next.inputLine = g_inputLine;
     }
-    next.sceneId = g_sceneId.load();
     next.warningState = static_cast<int>(g_tskWarningState);
     next.overlayEnabled = g_overlayEnabled.load();
     next.inputVisible = g_inputEnabled.load() && next.sceneId == 2;
@@ -1517,9 +1557,9 @@ void RenderGameUi(int screenWidth, int screenHeight)
     } else if (snapshot.overlayEnabled) {
         DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.infoLines,
             snapshot.alternateInfoLines.empty() ? nullptr : &snapshot.alternateInfoLines,
-            false, snapshot.secondaryInfoPage);
+            false, false);
     }
-    if (snapshot.reversalCounterLiveVisible && (snapshot.sceneId == 13 || snapshot.sceneId == 14))
+    if (snapshot.reversalCounterLiveVisible && IsReversalCounterDisplayScene(snapshot.sceneId))
         DrawLiveReversalCounter(draw, screenWidth, snapshot.reversalCounterCount, snapshot.reversalCounterStatus);
     if (snapshot.reversalCounterSummaryVisible && snapshot.sceneId <= 7 &&
         !(snapshot.sceneId == 2 && snapshot.titleHistoryVisible))
@@ -1616,7 +1656,6 @@ void RegisterReversalCounter(Clock::time_point now)
             g_reversalCounterStatus = L"RLcounter.txt への保存に失敗しました";
             OutputDebugStringW(L"[OIOverlay] Failed to append RLcounter.txt next to the module.\n");
         }
-        g_reversalCounterLiveVisible = true;
         return;
     }
 
@@ -1626,7 +1665,6 @@ void RegisterReversalCounter(Clock::time_point now)
         ConfirmPendingReversalCounter();
 
     ++g_reversalCounterCount;
-    g_reversalCounterLiveVisible = true;
     g_reversalCounterStatus.clear();
     g_reversalCounterPending = true;
     g_reversalCounterPendingClipEligible = true;
