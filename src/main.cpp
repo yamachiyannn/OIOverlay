@@ -7,6 +7,7 @@
 // Default.db is opened READ ONLY. This module never writes to it.
 
 #include <Windows.h>
+#include <mmsystem.h>
 #include <TlHelp32.h>
 #include <SokuLib.hpp>
 #include "TskDatabase.hpp"
@@ -104,6 +105,12 @@ std::uintmax_t g_dbSize = 0;
 FILETIME g_dbWriteTime{};
 
 using Clock = std::chrono::steady_clock;
+// A single F10 is a candidate RL count. A second F10 within three seconds
+// converts that candidate into a clip marker instead of a count.
+bool g_reversalCounterPending = false;
+bool g_reversalCounterPendingClipEligible = false;
+Clock::time_point g_reversalCounterPendingSince{};
+std::mutex g_reversalCounterMutex;
 Clock::time_point g_lastTskCheck{};
 Clock::time_point g_lastDbCheck{};
 Clock::time_point g_lastStatsRefresh{};
@@ -120,7 +127,7 @@ void UpdateInfoText();
 std::wstring CharacterName(int id);
 std::wstring RateText(int wins, int losses);
 void RefreshTitleHistory();
-void RegisterReversalCounter();
+void RegisterReversalCounter(Clock::time_point now);
 
 bool IsFileTimeEqual(const FILETIME& a, const FILETIME& b)
 {
@@ -1037,20 +1044,36 @@ return false;
 const int oldScene = g_sceneId;
 g_sceneId = scene;
 
-// Keep the counter through round transitions until SceneID returns to <= 7.
-// Once finalized, retain the large result until a new battle (13/14) starts.
-const bool newBattleScene = (scene == 13 || scene == 14);
-if (scene <= 7 && oldScene > 7 && g_reversalCounterLiveVisible) {
-    g_reversalCounterSummaryCount = g_reversalCounterCount;
-    g_reversalCounterSummaryVisible = true;
-    g_reversalCounterLiveVisible = false;
-}
-if (newBattleScene && g_reversalCounterSummaryVisible) {
-    g_reversalCounterCount = 0;
-    g_reversalCounterSummaryCount = 0;
-    g_reversalCounterSummaryVisible = false;
-    g_reversalCounterLiveVisible = false;
-    g_reversalCounterStatus.clear();
+{
+    std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
+    // A double-tap can only mark a clip while still in the same match scene.
+    // Keep the delayed confirmation alive when leaving battle, but don't allow a
+    // title/menu F10 or a new match to consume the previous match's pending tap.
+    const bool oldWasBattleScene = (oldScene == 13 || oldScene == 14);
+    const bool newBattleScene = (scene == 13 || scene == 14);
+    if (oldWasBattleScene && !newBattleScene && g_reversalCounterPending)
+        g_reversalCounterPendingClipEligible = false;
+
+    // Keep the counter through round transitions until SceneID returns to <= 7.
+    // Once finalized, retain the large result until a new battle (13/14) starts.
+    if (scene <= 7 && oldScene > 7 && g_reversalCounterLiveVisible) {
+        g_reversalCounterSummaryCount = g_reversalCounterCount;
+        g_reversalCounterSummaryVisible = true;
+        g_reversalCounterLiveVisible = false;
+    }
+    // Reset for every new match even when the user has manually hidden the summary.
+    // A pending count from the previous match remains scheduled for sound confirmation,
+    // but becomes ineligible for a clip marker as set above.
+    if (newBattleScene && !oldWasBattleScene && (g_reversalCounterSummaryVisible ||
+        g_reversalCounterCount != 0 || g_reversalCounterSummaryCount != 0)) {
+        g_reversalCounterCount = 0;
+        g_reversalCounterSummaryCount = 0;
+        g_reversalCounterSummaryVisible = false;
+        g_reversalCounterLiveVisible = false;
+        g_reversalCounterStatus.clear();
+        if (g_reversalCounterPending)
+            g_reversalCounterPendingClipEligible = false;
+    }
 }
 
     if (scene <= 7) {
@@ -1189,6 +1212,7 @@ struct RenderSnapshot
     bool inputVisible = false;
     bool warningBlink = false;
     bool titleHistoryVisible = false;
+    bool secondaryInfoPage = false;
     bool reversalCounterLiveVisible = false;
     bool reversalCounterSummaryVisible = false;
     int reversalCounterCount = 0;
@@ -1213,11 +1237,15 @@ void PublishRenderSnapshot()
     }
     next.titleHistoryLines = g_titleHistoryLines;
     next.titleHistoryVisible = g_titleHistoryVisible;
-    next.reversalCounterLiveVisible = g_reversalCounterLiveVisible;
-    next.reversalCounterSummaryVisible = g_reversalCounterSummaryVisible;
-    next.reversalCounterCount = g_reversalCounterCount;
-    next.reversalCounterSummaryCount = g_reversalCounterSummaryCount;
-    next.reversalCounterStatus = g_reversalCounterStatus;
+    next.secondaryInfoPage = g_displayPage != 0;
+    {
+        std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
+        next.reversalCounterLiveVisible = g_reversalCounterLiveVisible;
+        next.reversalCounterSummaryVisible = g_reversalCounterSummaryVisible;
+        next.reversalCounterCount = g_reversalCounterCount;
+        next.reversalCounterSummaryCount = g_reversalCounterSummaryCount;
+        next.reversalCounterStatus = g_reversalCounterStatus;
+    }
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
         next.inputLine = g_inputLine;
@@ -1266,7 +1294,8 @@ void DrawInfoPanel(
     int screenHeight,
     const std::vector<std::wstring>& sourceLines,
     const std::vector<std::wstring>* stableLayoutLines = nullptr,
-    bool alignTop = false)
+    bool alignTop = false,
+    bool opaqueBackground = false)
 {
     if (sourceLines.empty() || screenWidth <= 24 || screenHeight <= 24)
         return;
@@ -1319,8 +1348,15 @@ void DrawInfoPanel(
         ? 12.0f
         : (std::max)(8.0f, (static_cast<float>(screenHeight) - panelHeight) / 2.0f);
 
+    const bool useOpaqueBackground = alignTop || opaqueBackground;
+    const ImU32 panelBackground = useOpaqueBackground
+        ? IM_COL32(8, 8, 12, 255)  // Run-history pages fully cover text behind the panel.
+        : IM_COL32(8, 8, 12, 100);
+    const ImU32 panelBorder = useOpaqueBackground
+        ? IM_COL32(90, 115, 145, 230)
+        : IM_COL32(90, 115, 145, 155);
     AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
-        IM_COL32(8, 8, 12, 100), IM_COL32(90, 115, 145, 155));
+        panelBackground, panelBorder);
 
     float y = top + 5.0f;
     for (const auto& line : lines) {
@@ -1337,7 +1373,7 @@ void DrawInputPanel(ImDrawList* draw, int screenWidth, int screenHeight, const s
         return;
 
     const std::string inputUtf8 = WideToUtf8ForUi(inputLine);
-    const std::string help = "0~9 / . / : / Left / Right / BS / Del / Enter / Ctrl+V";
+    const std::string help = "0~9 / . / : / BSDel / Enter / CtrlV";
     const float fontSize = 16.0f;
     const float maxPanelWidth = static_cast<float>((std::max)(120, (std::min)(screenWidth - 24, 520)));
     ImFont* font = ImGui::GetFont();
@@ -1434,14 +1470,19 @@ void DrawReversalCounterSummary(ImDrawList* draw, int screenWidth, int screenHei
     if (screenWidth <= 24 || screenHeight <= 24)
         return;
     const std::string label = "RL: " + std::to_string(count);
+    const std::string hint = "F10: 非表示";
     const float fontSize = 48.0f;
+    const float hintFontSize = 10.0f;
     ImFont* font = ImGui::GetFont();
     const ImVec2 textSize = font->CalcTextSizeA(fontSize, 100000.0f, 0.0f,
         label.c_str(), label.c_str() + label.size());
+    const ImVec2 hintSize = font->CalcTextSizeA(hintFontSize, 100000.0f, 0.0f,
+        hint.c_str(), hint.c_str() + hint.size());
     const float paddingX = 28.0f;
     const float paddingY = 18.0f;
-    const float panelWidth = textSize.x + paddingX * 2.0f;
-    const float panelHeight = textSize.y + paddingY * 2.0f;
+    const float hintGap = 3.0f;
+    const float panelWidth = (std::max)(textSize.x, hintSize.x) + paddingX * 2.0f;
+    const float panelHeight = textSize.y + paddingY * 2.0f + hintGap + hintSize.y;
     const float left = (static_cast<float>(screenWidth) - panelWidth) / 2.0f;
     const float top = (static_cast<float>(screenHeight) - panelHeight) / 2.0f;
     AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
@@ -1449,6 +1490,10 @@ void DrawReversalCounterSummary(ImDrawList* draw, int screenWidth, int screenHei
     const float textLeft = left + (panelWidth - textSize.x) / 2.0f;
     draw->AddText(font, fontSize, ImVec2(textLeft, top + paddingY),
         IM_COL32(255, 255, 255, 255), label.c_str());
+    const float hintLeft = left + (panelWidth - hintSize.x) / 2.0f;
+    draw->AddText(font, hintFontSize,
+        ImVec2(hintLeft, top + paddingY + textSize.y + hintGap),
+        IM_COL32(205, 215, 230, 235), hint.c_str());
 }
 
 void RenderGameUi(int screenWidth, int screenHeight)
@@ -1471,7 +1516,8 @@ void RenderGameUi(int screenWidth, int screenHeight)
         DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.titleHistoryLines, nullptr, true);
     } else if (snapshot.overlayEnabled) {
         DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.infoLines,
-            snapshot.alternateInfoLines.empty() ? nullptr : &snapshot.alternateInfoLines, false);
+            snapshot.alternateInfoLines.empty() ? nullptr : &snapshot.alternateInfoLines,
+            false, snapshot.secondaryInfoPage);
     }
     if (snapshot.reversalCounterLiveVisible && (snapshot.sceneId == 13 || snapshot.sceneId == 14))
         DrawLiveReversalCounter(draw, screenWidth, snapshot.reversalCounterCount, snapshot.reversalCounterStatus);
@@ -1494,7 +1540,7 @@ void RefreshTitleHistory()
     }
 
     std::vector<TskRunStats> runs;
-    if (!g_database->GetRecentRuns(20, 30, runs)) {
+    if (!g_database->GetRecentRuns(20, 0, runs)) {
         lines.push_back(L"連戦履歴の読み込みに失敗しました");
     } else if (runs.empty()) {
         lines.push_back(L"表示できる連戦履歴がありません");
@@ -1505,8 +1551,47 @@ void RefreshTitleHistory()
     g_titleHistoryLines = std::move(lines);
 }
 
-void RegisterReversalCounter()
+void PlayReversalNoticeIfAvailable()
 {
+    // OIOverlay is loaded into th123.exe, so WinMM plays the optional WAV from
+    // the game's process without launching another application/window.
+    // A missing file is normal and intentionally silent.
+    const std::wstring directory = OverlayModuleDirectory();
+    if (directory.empty())
+        return;
+    const std::wstring wavPath = directory + L"\\RLnotice.wav";
+    if (!FileExists(wavPath))
+        return;
+    if (!PlaySoundW(wavPath.c_str(), nullptr,
+        SND_FILENAME | SND_ASYNC | SND_NODEFAULT)) {
+        OutputDebugStringW(L"[OIOverlay] RLnotice.wav exists but could not be played.\n");
+    }
+}
+
+void ConfirmPendingReversalCounter()
+{
+    if (!g_reversalCounterPending)
+        return;
+
+    g_reversalCounterPending = false;
+    g_reversalCounterPendingClipEligible = false;
+    // The count was already incremented on the first press. Confirmation only
+    // plays the optional notice; it must not touch RLcounter.txt.
+    PlayReversalNoticeIfAvailable();
+}
+
+void UpdatePendingReversalCounter(Clock::time_point now)
+{
+    std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
+    if (g_reversalCounterPending &&
+        now - g_reversalCounterPendingSince >= std::chrono::seconds(3)) {
+        ConfirmPendingReversalCounter();
+    }
+}
+
+void RegisterReversalCounter(Clock::time_point now)
+{
+    std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
     if (g_sceneId != 13 && g_sceneId != 14)
         return;
 
@@ -1514,19 +1599,38 @@ void RegisterReversalCounter()
     std::string opponent = ReadProfile(offset);
     if (opponent.empty())
         opponent = g_opponentProfile;
-
     const std::wstring opponentWide = opponent.empty() ? L"不明" : Cp932ToWide(opponent);
-    const std::wstring line = CurrentCounterTimestamp() + L"_[" + opponentWide + L"]";
 
-    // Count the press immediately. A disk error is reported in the live HUD
-    // but does not discard the in-memory count for the current match.
+    // A second press within three seconds is a clip marker, not an RL count.
+    // Undo the candidate count from the first press, then append only this
+    // second press's timestamp to RLcounter.txt.
+    if (g_reversalCounterPending && g_reversalCounterPendingClipEligible &&
+        now - g_reversalCounterPendingSince < std::chrono::seconds(3)) {
+        if (g_reversalCounterCount > 0)
+            --g_reversalCounterCount;
+        g_reversalCounterPending = false;
+        g_reversalCounterPendingClipEligible = false;
+        const std::wstring line = CurrentCounterTimestamp() + L"_[" + opponentWide + L"]";
+        g_reversalCounterStatus.clear();
+        if (!AppendCounterText(line)) {
+            g_reversalCounterStatus = L"RLcounter.txt への保存に失敗しました";
+            OutputDebugStringW(L"[OIOverlay] Failed to append RLcounter.txt next to the module.\n");
+        }
+        g_reversalCounterLiveVisible = true;
+        return;
+    }
+
+    // If the last candidate has expired (or belongs to a previous match),
+    // confirm it before beginning a fresh candidate for this press.
+    if (g_reversalCounterPending)
+        ConfirmPendingReversalCounter();
+
     ++g_reversalCounterCount;
     g_reversalCounterLiveVisible = true;
     g_reversalCounterStatus.clear();
-    if (!AppendCounterText(line)) {
-        g_reversalCounterStatus = L"RLcounter.txt への保存に失敗しました";
-        OutputDebugStringW(L"[OIOverlay] Failed to append RLcounter.txt next to the module.\n");
-    }
+    g_reversalCounterPending = true;
+    g_reversalCounterPendingClipEligible = true;
+    g_reversalCounterPendingSince = now;
 }
 
 void PollIpInputFromGameFrame()
@@ -1676,12 +1780,23 @@ DWORD WINAPI OverlayThread(void*)
         const int currentScene = g_sceneId.load();
         const bool gameForeground = IsGameForeground();
 
-        if (gameForeground && f10Pressed && currentScene == 2) {
+        bool dismissedReversalSummary = false;
+        if (gameForeground && f10Pressed && currentScene <= 7) {
+            std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
+            if (g_reversalCounterSummaryVisible) {
+                // While the post-match count is visible, F10 means "hide this result".
+                // The title-history toggle remains available once the result is hidden.
+                g_reversalCounterSummaryVisible = false;
+                dismissedReversalSummary = true;
+            }
+        }
+        if (!dismissedReversalSummary && gameForeground && f10Pressed && currentScene == 2) {
             g_titleHistoryVisible = !g_titleHistoryVisible;
             if (g_titleHistoryVisible)
                 RefreshTitleHistory();
-        } else if (gameForeground && f10Pressed && (currentScene == 13 || currentScene == 14)) {
-            RegisterReversalCounter();
+        } else if (!dismissedReversalSummary && gameForeground && f10Pressed &&
+            (currentScene == 13 || currentScene == 14)) {
+            RegisterReversalCounter(now);
         } else if (gameForeground && togglePressed && currentScene > 7 &&
             currentScene != 13 && currentScene != 14 && currentScene != 2) {
             const bool enable = !g_overlayEnabled.load();
@@ -1697,8 +1812,10 @@ DWORD WINAPI OverlayThread(void*)
         g_previousAsyncF10Down = toggleDown;
         g_previousF10Down = f10Down;
 
+        UpdatePendingReversalCounter(now);
+
         if ((IsNormalInfoScene(currentScene) || currentScene == 12 || currentScene == 15) &&
-            now - g_lastPageFlip >= std::chrono::seconds(1)) {
+            now - g_lastPageFlip >= std::chrono::seconds(3)) {
             if (CanFlipToSecondaryPage(currentScene)) {
                 g_displayPage = 1 - g_displayPage;
             } else {

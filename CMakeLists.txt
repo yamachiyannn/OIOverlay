@@ -240,6 +240,7 @@ target_link_libraries(
     d3dx9
     user32
     gdi32
+    winmm
 )
 
 set_target_properties(
