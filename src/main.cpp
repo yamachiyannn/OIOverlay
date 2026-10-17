@@ -324,7 +324,7 @@ std::wstring RunLine(const TskRunStats& run, bool includeProfile)
         << std::setw(2) << run.losses << L"敗　("
         << RateText(run.wins, run.losses) << L")";
     if (includeProfile)
-        out << L"　[" << ProfileDisplayName(run.profileNameCp932) << L"]";
+        out << L"　" << ProfileDisplayName(run.profileNameCp932);
     return out.str();
 }
 
@@ -593,17 +593,24 @@ void AppendWatchingSecondaryPlayer(
 {
     text += std::wstring(label) + L" ";
     if (!statsValid || !stats.found) {
-        text += L"対戦記録がありません\n";
+        text += L"対戦記録がありません";
         return;
     }
-    text += MainCharacterRecordLine(stats) + L"\n";
+
+    // Keep the existing character record, with one blank line before the
+    // recent-run list. Spectator page 2 intentionally shows at most 3 runs;
+    // character-select keeps its existing 5-run view.
+    text += MainCharacterRecordLine(stats) + L"\n\n";
     if (stats.recentRuns.empty()) {
-        text += L"  連戦履歴なし\n";
+        text += L"連戦履歴なし";
         return;
     }
-    for (size_t i = 0; i < stats.recentRuns.size(); ++i) {
+
+    const size_t runCount = (std::min)(static_cast<size_t>(3), stats.recentRuns.size());
+    for (size_t i = 0; i < runCount; ++i) {
+        if (i > 0)
+            text += L"\n";
         text += L"  " + RunLine(stats.recentRuns[i], false);
-        text += L"\n";
     }
 }
 
@@ -613,7 +620,7 @@ std::wstring BuildWatchingSecondaryInfo()
     if (g_watchingP1Profile.empty() || g_watchingP2Profile.empty())
         return text + L"1P / 2Pのプロファイルを取得中...";
     AppendWatchingSecondaryPlayer(text, L"1P", g_watchP1Stats, g_watchP1StatsValid);
-    text += L"\n";
+    text += L"\n\n";
     AppendWatchingSecondaryPlayer(text, L"2P", g_watchP2Stats, g_watchP2StatsValid);
     return text;
 }
@@ -1372,7 +1379,9 @@ void DrawInfoPanel(
     const std::vector<std::wstring>& sourceLines,
     const std::vector<std::wstring>* stableLayoutLines = nullptr,
     bool alignTop = false,
-    bool opaqueBackground = false)
+    bool opaqueBackground = false,
+    float verticalOffset = 0.0f,
+    int transparentBackgroundAlpha = 100)
 {
     if (sourceLines.empty() || screenWidth <= 24 || screenHeight <= 24)
         return;
@@ -1421,17 +1430,25 @@ void DrawInfoPanel(
     // widths/heights, so flipping pages never makes the panel jump.
     const float panelHeight = (std::max)(currentContentHeight, otherContentHeight) + 12.0f;
     const float left = 12.0f;
-    const float top = alignTop
+    float top = alignTop
         ? 12.0f
         : (std::max)(8.0f, (static_cast<float>(screenHeight) - panelHeight) / 2.0f);
+    if (!alignTop && verticalOffset != 0.0f) {
+        // Shift the spectator panel down without allowing it to leave the
+        // visible game frame on shorter resolutions.
+        const float maxTop = (std::max)(8.0f, static_cast<float>(screenHeight) - panelHeight - 8.0f);
+        top = (std::min)(maxTop, (std::max)(8.0f, top + verticalOffset));
+    }
 
     const bool useOpaqueBackground = alignTop || opaqueBackground;
+    const int backgroundAlpha = (std::max)(0, (std::min)(255, transparentBackgroundAlpha));
     const ImU32 panelBackground = useOpaqueBackground
-        ? IM_COL32(8, 8, 12, 255)  // Run-history pages fully cover text behind the panel.
-        : IM_COL32(8, 8, 12, 100);
+        ? IM_COL32(8, 8, 12, 255)  // Title history remains fully opaque.
+        : IM_COL32(8, 8, 12, backgroundAlpha);
+    const int borderAlpha = (std::min)(255, backgroundAlpha + 55);
     const ImU32 panelBorder = useOpaqueBackground
         ? IM_COL32(90, 115, 145, 230)
-        : IM_COL32(90, 115, 145, 155);
+        : IM_COL32(90, 115, 145, borderAlpha);
     AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
         panelBackground, panelBorder);
 
@@ -1592,9 +1609,12 @@ void RenderGameUi(int screenWidth, int screenHeight)
     if (snapshot.titleHistoryVisible && snapshot.sceneId == 2) {
         DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.titleHistoryLines, nullptr, true);
     } else if (snapshot.overlayEnabled) {
+        const bool spectatorScene = snapshot.sceneId == 12 || snapshot.sceneId == 15;
         DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.infoLines,
             snapshot.alternateInfoLines.empty() ? nullptr : &snapshot.alternateInfoLines,
-            false, snapshot.secondaryInfoPage);
+            false, false,
+            spectatorScene ? 150.0f : 0.0f,
+            spectatorScene ? 125 : 100);
     }
     if (snapshot.reversalCounterLiveVisible &&
         (snapshot.sceneId == 8 || snapshot.sceneId == 9 || snapshot.sceneId == 10 ||
