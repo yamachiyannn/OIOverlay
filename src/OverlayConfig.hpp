@@ -8,6 +8,7 @@ struct OverlayConfig
     std::wstring tskDbPath;
     std::wstring playersDbPath;
     bool defaultVisible = true;
+    bool defaultWatchingVisible = true;
     UINT toggleKey = VK_F10;
     std::wstring iniPath;
 };

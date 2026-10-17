@@ -112,6 +112,7 @@ using Clock = std::chrono::steady_clock;
 bool g_reversalCounterPending = false;
 bool g_reversalCounterPendingClipEligible = false;
 Clock::time_point g_reversalCounterPendingSince{};
+Clock::time_point g_reversalClipFeedbackUntil{};
 enum class ReversalSessionState { None, Battle, Spectator };
 ReversalSessionState g_reversalSessionState = ReversalSessionState::None;
 std::string g_reversalBattleOpponentProfile;
@@ -803,6 +804,42 @@ void RemoveIpCharacterAtCursor()
     }
 }
 
+bool IsValidIpv4Literal(const std::wstring& value)
+{
+    size_t position = 0;
+    for (int octet = 0; octet < 4; ++octet) {
+        const size_t start = position;
+        unsigned int number = 0;
+        while (position < value.size() && value[position] >= L'0' && value[position] <= L'9') {
+            if (position - start >= 3)
+                return false;
+            number = number * 10U + static_cast<unsigned int>(value[position] - L'0');
+            ++position;
+        }
+        if (position == start || number > 255U)
+            return false;
+        if (octet < 3) {
+            if (position >= value.size() || value[position] != L'.')
+                return false;
+            ++position;
+        }
+    }
+    return position == value.size();
+}
+
+std::wstring CompleteDefaultPortForClipboard(const std::wstring& value)
+{
+    // Complete only a bare IPv4 address or IPv4 followed by a trailing colon.
+    // An explicitly supplied port (for example, 1.2.3.4:12345) is left alone.
+    if (!value.empty() && value.back() == L':') {
+        const std::wstring ip = value.substr(0, value.size() - 1);
+        return IsValidIpv4Literal(ip) ? value + L"10800" : value;
+    }
+    if (value.find(L':') == std::wstring::npos && IsValidIpv4Literal(value))
+        return value + L":10800";
+    return value;
+}
+
 void CopyInputToClipboardAndClear()
 {
     const std::wstring value = GetInputBufferSnapshot();
@@ -814,7 +851,8 @@ void CopyInputToClipboardAndClear()
         return;
     }
 
-    if (SetClipboardText(value)) {
+    const std::wstring clipboardValue = CompleteDefaultPortForClipboard(value);
+    if (SetClipboardText(clipboardValue)) {
         g_clipboardStatus.store(1);
         ClearInputBuffer();
         std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -1110,6 +1148,7 @@ g_sceneId = scene;
         g_reversalCounterCount = 0;
         g_reversalCounterSummaryCount = 0;
         g_reversalCounterStatus.clear();
+        g_reversalClipFeedbackUntil = Clock::time_point{};
         g_reversalBattleOpponentProfile.clear();
     } else if (scene <= 7) {
         if (g_reversalSessionState == ReversalSessionState::Battle && oldScene > 7) {
@@ -1133,6 +1172,7 @@ g_sceneId = scene;
             g_reversalCounterCount = 0;
             g_reversalCounterSummaryCount = 0;
             g_reversalCounterStatus.clear();
+            g_reversalClipFeedbackUntil = Clock::time_point{};
         }
         g_reversalSessionState = ReversalSessionState::None;
         g_reversalBattleOpponentProfile.clear();
@@ -1146,6 +1186,7 @@ g_sceneId = scene;
         g_reversalCounterStatus.clear();
         g_reversalCounterPending = false;
         g_reversalCounterPendingClipEligible = false;
+        g_reversalClipFeedbackUntil = Clock::time_point{};
         g_reversalBattleOpponentProfile.clear();
         CaptureBattleOpponentProfile();
     } else if (newBattleScene) {
@@ -1174,9 +1215,12 @@ g_sceneId = scene;
 
     if (scene <= 7) {
         g_overlayManuallyDisabledForSession = false;
-    } else if ((scene == 8 || scene == 9 || scene == 12) && oldScene <= 7) {
+    } else if ((IsNormalInfoScene(scene) || scene == 12 || scene == 15) && oldScene <= 7) {
         if (!g_overlayManuallyDisabledForSession) {
-            g_overlayEnabled.store(g_config.defaultVisible);
+            const bool watchingScene = scene == 12 || scene == 15;
+            g_overlayEnabled.store(watchingScene
+                ? g_config.defaultWatchingVisible
+                : g_config.defaultVisible);
         }
     }
 
@@ -1298,6 +1342,7 @@ struct RenderSnapshot
     bool titleHistoryVisible = false;
     bool secondaryInfoPage = false;
     bool reversalCounterLiveVisible = false;
+    bool reversalClipFeedback = false;
     bool reversalCounterSummaryVisible = false;
     int reversalCounterCount = 0;
     int reversalCounterSummaryCount = 0;
@@ -1325,6 +1370,7 @@ void PublishRenderSnapshot()
     {
         std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
         next.reversalCounterLiveVisible = g_reversalCounterLiveVisible;
+        next.reversalClipFeedback = Clock::now() < g_reversalClipFeedbackUntil;
         next.reversalCounterSummaryVisible = g_reversalCounterSummaryVisible;
         next.reversalCounterCount = g_reversalCounterCount;
         next.reversalCounterSummaryCount = g_reversalCounterSummaryCount;
@@ -1532,7 +1578,8 @@ void DrawWarningPanel(ImDrawList* draw, int screenWidth, int screenHeight, int w
         IM_COL32(255, 255, 255, 255), subtitle.c_str(), subtitle.c_str() + subtitle.size(), panelWidth - 24.0f);
 }
 
-void DrawLiveReversalCounter(ImDrawList* draw, int screenWidth, int count, const std::wstring& status)
+void DrawLiveReversalCounter(
+    ImDrawList* draw, int screenWidth, int count, const std::wstring& status, bool clipFeedback)
 {
     if (screenWidth <= 64)
         return;
@@ -1548,10 +1595,19 @@ void DrawLiveReversalCounter(ImDrawList* draw, int screenWidth, int count, const
     const float panelHeight = textSize.y + paddingY * 2.0f + statusHeight;
     const float left = static_cast<float>(screenWidth) - panelWidth - 12.0f;
     const float top = 12.0f;
+    const ImU32 panelBackground = clipFeedback
+        ? IM_COL32(255, 255, 255, 255)
+        : IM_COL32(8, 8, 12, 125);
+    const ImU32 panelBorder = clipFeedback
+        ? IM_COL32(255, 255, 255, 255)
+        : IM_COL32(90, 115, 145, 175);
+    const ImU32 labelColor = clipFeedback
+        ? IM_COL32(0, 0, 0, 255)
+        : IM_COL32(255, 255, 255, 255);
     AddPanel(draw, ImVec2(left, top), ImVec2(left + panelWidth, top + panelHeight),
-        IM_COL32(8, 8, 12, 125), IM_COL32(90, 115, 145, 175));
+        panelBackground, panelBorder);
     draw->AddText(font, fontSize, ImVec2(left + paddingX, top + paddingY),
-        IM_COL32(255, 255, 255, 255), label.c_str());
+        labelColor, label.c_str());
     if (!status.empty()) {
         const std::string statusUtf8 = WideToUtf8ForUi(status);
         draw->AddText(font, 9.0f, ImVec2(left + paddingX, top + paddingY + textSize.y),
@@ -1619,7 +1675,8 @@ void RenderGameUi(int screenWidth, int screenHeight)
     if (snapshot.reversalCounterLiveVisible &&
         (snapshot.sceneId == 8 || snapshot.sceneId == 9 || snapshot.sceneId == 10 ||
          snapshot.sceneId == 11 || snapshot.sceneId == 13 || snapshot.sceneId == 14))
-        DrawLiveReversalCounter(draw, screenWidth, snapshot.reversalCounterCount, snapshot.reversalCounterStatus);
+        DrawLiveReversalCounter(draw, screenWidth, snapshot.reversalCounterCount,
+            snapshot.reversalCounterStatus, snapshot.reversalClipFeedback);
     if (snapshot.reversalCounterSummaryVisible && snapshot.sceneId <= 7 &&
         !(snapshot.sceneId == 2 && snapshot.titleHistoryVisible))
         DrawReversalCounterSummary(draw, screenWidth, screenHeight, snapshot.reversalCounterSummaryCount);
@@ -1719,8 +1776,13 @@ void RegisterReversalCounter(Clock::time_point now)
         const std::wstring line = CurrentCounterTimestamp() + L"_[" + opponentWide + L"]";
         g_reversalCounterStatus.clear();
         if (!AppendCounterText(line)) {
+            g_reversalClipFeedbackUntil = Clock::time_point{};
             g_reversalCounterStatus = L"RLcounter.txt への保存に失敗しました";
             OutputDebugStringW(L"[OIOverlay] Failed to append RLcounter.txt next to the module.\n");
+        } else {
+            // A successful clip marker gets a full one-second, opaque white
+            // background so the user can immediately confirm that it was saved.
+            g_reversalClipFeedbackUntil = Clock::now() + std::chrono::seconds(1);
         }
         g_reversalCounterLiveVisible = true;
         return;

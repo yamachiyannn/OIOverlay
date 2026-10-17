@@ -54,6 +54,14 @@ OverlayConfig LoadOverlayConfig(HMODULE module)
     config.defaultVisible = (visibleEnd == visible.c_str() || *visibleEnd != L'\0')
         ? true : visibleValue != 0;
 
+    std::wstring watchingVisible;
+    ReadString(L"Overlay", L"DefaultWatchingVisible", L"1", config.iniPath, watchingVisible);
+    wchar_t* watchingVisibleEnd = nullptr;
+    const long watchingVisibleValue = std::wcstol(watchingVisible.c_str(), &watchingVisibleEnd, 10);
+    config.defaultWatchingVisible =
+        (watchingVisibleEnd == watchingVisible.c_str() || *watchingVisibleEnd != L'\0')
+        ? true : watchingVisibleValue != 0;
+
     std::wstring key;
     ReadString(L"Overlay", L"ToggleKey", L"0x79", config.iniPath, key);
     wchar_t* end = nullptr;
