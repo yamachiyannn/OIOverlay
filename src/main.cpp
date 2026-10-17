@@ -46,6 +46,8 @@ HWND g_gameWindow = nullptr;
 HHOOK g_keyboardHook = nullptr;
 volatile LONG g_stopRequested = 0;
 std::atomic<int> g_sceneId{-1};
+enum class ConnectionRole { Unknown, Host, Client };
+ConnectionRole g_connectionRole = ConnectionRole::Unknown;
 bool g_clientMode = false;
 std::atomic<bool> g_overlayEnabled{true};
 // Tracks the configurable overlay-toggle key and F10 separately. F10 has
@@ -58,9 +60,7 @@ int g_displayPage = 0;
 bool g_titleHistoryVisible = false;
 std::vector<std::wstring> g_titleHistoryLines;
 int g_reversalCounterCount = 0;
-// True from the first observed SceneID 8..14 until the game returns to <= 7.
-// This is independent of whether the user has pressed F10, so zero-count runs are saved too.
-bool g_reversalCounterRunActive = false;
+bool g_reversalCounterLiveVisible = false;
 bool g_reversalCounterSummaryVisible = false;
 int g_reversalCounterSummaryCount = 0;
 std::wstring g_reversalCounterStatus;
@@ -112,6 +112,10 @@ using Clock = std::chrono::steady_clock;
 bool g_reversalCounterPending = false;
 bool g_reversalCounterPendingClipEligible = false;
 Clock::time_point g_reversalCounterPendingSince{};
+enum class ReversalSessionState { None, Battle, Spectator };
+ReversalSessionState g_reversalSessionState = ReversalSessionState::None;
+std::string g_reversalBattleOpponentProfile;
+
 std::mutex g_reversalCounterMutex;
 Clock::time_point g_lastTskCheck{};
 Clock::time_point g_lastDbCheck{};
@@ -130,6 +134,8 @@ std::wstring CharacterName(int id);
 std::wstring RateText(int wins, int losses);
 void RefreshTitleHistory();
 void RegisterReversalCounter(Clock::time_point now);
+void ConfirmPendingReversalCounter();
+bool AppendReversalSummary(int count);
 
 bool IsFileTimeEqual(const FILETIME& a, const FILETIME& b)
 {
@@ -347,6 +353,15 @@ std::string WideToUtf8String(const std::wstring& value)
     return result;
 }
 
+std::wstring CurrentCounterDate()
+{
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    std::wostringstream out;
+    out << now.wYear << L"/" << now.wMonth << L"/" << now.wDay;
+    return out.str();
+}
+
 std::wstring CurrentCounterTimestamp()
 {
     SYSTEMTIME now{};
@@ -356,18 +371,6 @@ std::wstring CurrentCounterTimestamp()
         << std::setfill(L'0') << std::setw(2) << now.wHour << L":"
         << std::setw(2) << now.wMinute << L":"
         << std::setw(2) << now.wSecond;
-    return out.str();
-}
-
-std::wstring CurrentRunSummaryLine(int count, const std::wstring& opponentName)
-{
-    SYSTEMTIME now{};
-    GetLocalTime(&now);
-    std::wostringstream out;
-    out << std::setfill(L'0') << std::setw(4) << now.wYear << L"/"
-        << std::setw(2) << now.wMonth << L"/" << std::setw(2) << now.wDay
-        << L"_RL: " << count << L"_["
-        << (opponentName.empty() ? L"不明" : opponentName) << L"]";
     return out.str();
 }
 
@@ -493,17 +496,6 @@ return text;
 bool IsNormalInfoScene(int scene)
 {
 return scene >= 8 && scene <= 11;
-}
-
-bool IsReversalCounterSeriesScene(int scene)
-{
-return scene >= 8 && scene <= 14;
-}
-
-bool IsReversalCounterDisplayScene(int scene)
-{
-return scene == 8 || scene == 9 || scene == 10 || scene == 11 ||
-    scene == 13 || scene == 14;
 }
 
 std::wstring BuildNormalInfo()
@@ -1058,6 +1050,31 @@ g_cachedWatchingP2 = g_watchingP2Profile;
 }
 }
 
+bool CaptureBattleOpponentProfile()
+{
+    uintptr_t offset = kRightProfileOffset;
+    if (g_connectionRole == ConnectionRole::Client)
+        offset = kLeftProfileOffset;
+    else if (g_connectionRole == ConnectionRole::Unknown)
+        offset = kRightProfileOffset; // Scene 13/14 without a preceding Scene 9 is host-side.
+
+    const std::string opponent = ReadProfile(offset);
+    if (opponent.empty())
+        return false;
+    g_opponentProfile = opponent;
+    g_reversalBattleOpponentProfile = opponent;
+    return true;
+}
+
+bool AppendReversalSummary(int count)
+{
+    const std::string profile = !g_reversalBattleOpponentProfile.empty()
+        ? g_reversalBattleOpponentProfile : g_opponentProfile;
+    const std::wstring opponent = profile.empty() ? L"不明" : ProfileDisplayName(profile);
+    const std::wstring line = CurrentCounterDate() + L"_RL: " + std::to_wstring(count) + L"_[" + opponent + L"]";
+    return AppendCounterText(line);
+}
+
 bool UpdateSceneState()
 {
 int scene = -1;
@@ -1071,44 +1088,67 @@ g_sceneId = scene;
 
 {
     std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
-    // A double-tap can only mark a clip while still in the same match scene.
-    // Keep delayed confirmation alive when leaving battle, but don't let a later
-    // title/menu F10 or another series consume the previous tap.
     const bool oldWasBattleScene = (oldScene == 13 || oldScene == 14);
     const bool newBattleScene = (scene == 13 || scene == 14);
-    if (oldWasBattleScene && !newBattleScene && g_reversalCounterPending)
+    const bool newSpectatorScene = (scene == 12 || scene == 15);
+
+    // Spectator mode is not a reversal-counter session. If the game returns
+    // from spectator mode to <=7, do not show or write a battle result.
+    if (newSpectatorScene) {
+        g_reversalSessionState = ReversalSessionState::Spectator;
+        g_reversalCounterPending = false;
         g_reversalCounterPendingClipEligible = false;
-
-    // SceneID <= 7 ends the active series. Finalize and append exactly once,
-    // regardless of the count (including zero) or whether RL was displayed before.
-    if (scene <= 7 && g_reversalCounterRunActive) {
-        g_reversalCounterSummaryCount = g_reversalCounterCount;
-        g_reversalCounterSummaryVisible = true;
-
-        std::string opponent = g_opponentProfile;
-        if (opponent.empty()) {
-            const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
-            opponent = ReadProfile(offset);
+        g_reversalCounterLiveVisible = false;
+        g_reversalCounterSummaryVisible = false;
+        g_reversalCounterCount = 0;
+        g_reversalCounterSummaryCount = 0;
+        g_reversalCounterStatus.clear();
+        g_reversalBattleOpponentProfile.clear();
+    } else if (scene <= 7) {
+        if (g_reversalSessionState == ReversalSessionState::Battle && oldScene > 7) {
+            // Only a real battle -> <=7 transition finalizes and logs the run.
+            // This intentionally includes RL: 0.
+            if (g_reversalCounterPending)
+                ConfirmPendingReversalCounter();
+            g_reversalCounterSummaryCount = g_reversalCounterCount;
+            g_reversalCounterSummaryVisible = true;
+            g_reversalCounterLiveVisible = false;
+            if (!AppendReversalSummary(g_reversalCounterCount)) {
+                g_reversalCounterStatus = L"RLcounter.txt への保存に失敗しました";
+                OutputDebugStringW(L"[OIOverlay] Failed to append RL summary to RLcounter.txt.\n");
+            }
+        } else {
+            // In particular, spectator -> <=7 must not leave an RL result behind.
+            g_reversalCounterPending = false;
+            g_reversalCounterPendingClipEligible = false;
+            g_reversalCounterLiveVisible = false;
+            g_reversalCounterSummaryVisible = false;
+            g_reversalCounterCount = 0;
+            g_reversalCounterSummaryCount = 0;
+            g_reversalCounterStatus.clear();
         }
-        const std::wstring opponentWide = opponent.empty() ? L"不明" : Cp932ToWide(opponent);
-        if (!AppendCounterText(CurrentRunSummaryLine(g_reversalCounterSummaryCount, opponentWide))) {
-            OutputDebugStringW(L"[OIOverlay] Failed to append series summary to RLcounter.txt.\n");
-        }
-        g_reversalCounterRunActive = false;
-    }
-
-    // The first observed SceneID 8..14 starts a new series. Reset here rather
-    // than on 13/14 transitions, because the counter must survive all transitions
-    // within the same 8..14 sequence.
-    if (IsReversalCounterSeriesScene(scene) && !g_reversalCounterRunActive) {
-        g_reversalCounterRunActive = true;
+        g_reversalSessionState = ReversalSessionState::None;
+        g_reversalBattleOpponentProfile.clear();
+    } else if (newBattleScene && g_reversalSessionState != ReversalSessionState::Battle) {
+        // A battle entered from title/menu or spectator starts a fresh RL session.
+        g_reversalSessionState = ReversalSessionState::Battle;
         g_reversalCounterCount = 0;
         g_reversalCounterSummaryCount = 0;
         g_reversalCounterSummaryVisible = false;
+        g_reversalCounterLiveVisible = true;
         g_reversalCounterStatus.clear();
-        if (g_reversalCounterPending)
-            g_reversalCounterPendingClipEligible = false;
+        g_reversalCounterPending = false;
+        g_reversalCounterPendingClipEligible = false;
+        g_reversalBattleOpponentProfile.clear();
+        CaptureBattleOpponentProfile();
+    } else if (newBattleScene) {
+        // Scene 13 -> 14 (or 14 -> 13) is the same battle; preserve the count.
+        CaptureBattleOpponentProfile();
     }
+
+    // A double-tap can only mark a clip while still in the same battle scene.
+    if (oldWasBattleScene && !newBattleScene && g_reversalCounterPending)
+        g_reversalCounterPendingClipEligible = false;
 }
 
     if (scene <= 7) {
@@ -1125,8 +1165,6 @@ g_sceneId = scene;
         g_titleHistoryLines.clear();
     }
 
-    // A new character-select / spectator-loading session starts enabled by default.
-    // Once F10 disables the overlay, keep it disabled until the game returns to SceneID <= 7.
     if (scene <= 7) {
         g_overlayManuallyDisabledForSession = false;
     } else if ((scene == 8 || scene == 9 || scene == 12) && oldScene <= 7) {
@@ -1137,16 +1175,21 @@ g_sceneId = scene;
 
 if (scene <= 7) {
 g_clientMode = false;
+g_connectionRole = ConnectionRole::Unknown;
 g_opponentProfile.clear();
 g_normalStats = {};
 g_normalStatsValid = false;
 g_cachedNormalProfile.clear();
 } else if (scene == 9) {
-// OIV remembers client mode until the scene returns below 8.
 g_clientMode = true;
+g_connectionRole = ConnectionRole::Client;
+} else if ((scene == 8 || scene == 10 || scene == 11) && g_connectionRole == ConnectionRole::Unknown) {
+// Scene 8/10/11 do not reliably identify the side after a previous match.
+// Only infer host when no earlier Scene 9 established client mode.
+g_clientMode = false;
+g_connectionRole = ConnectionRole::Host;
 }
 
-// SceneID 2 only. Any transition out clears the pending input immediately.
 if (scene == 2) {
 ClearInputBuffer();
 g_inputEnabled = true;
@@ -1156,7 +1199,6 @@ g_inputEnabled = false;
 }
 
 if (scene == 12 || scene == 15) {
-// Spectator profiles/stats are re-read only at scene transitions.
 const std::string p1 = ReadProfile(kLeftProfileOffset);
 const std::string p2 = ReadProfile(kRightProfileOffset);
 if (p1 != g_watchingP1Profile) {
@@ -1172,9 +1214,9 @@ g_watchP2StatsValid = false;
 g_cachedWatchingP2.clear();
 }
 } else if (scene >= 8 && scene <= 11) {
-const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
+const uintptr_t offset = g_connectionRole == ConnectionRole::Client ? kLeftProfileOffset : kRightProfileOffset;
 const std::string opponent = ReadProfile(offset);
-if (opponent != g_opponentProfile) {
+if (!opponent.empty() && opponent != g_opponentProfile) {
 g_opponentProfile = opponent;
 g_normalStats = {};
 g_normalStatsValid = false;
@@ -1182,13 +1224,6 @@ g_cachedNormalProfile.clear();
 }
 if (oldScene <= 7 && opponent.empty())
 g_opponentProfile.clear();
-} else if (scene == 13 || scene == 14) {
-// Usually the opponent was captured in SceneID 8..11; refresh it here too
-// so the end-of-series log still has a name if those scenes were skipped.
-const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
-const std::string opponent = ReadProfile(offset);
-if (!opponent.empty())
-g_opponentProfile = opponent;
 }
 
 return true;
@@ -1254,6 +1289,7 @@ struct RenderSnapshot
     bool inputVisible = false;
     bool warningBlink = false;
     bool titleHistoryVisible = false;
+    bool secondaryInfoPage = false;
     bool reversalCounterLiveVisible = false;
     bool reversalCounterSummaryVisible = false;
     int reversalCounterCount = 0;
@@ -1267,7 +1303,6 @@ RenderSnapshot g_renderSnapshot;
 void PublishRenderSnapshot()
 {
     RenderSnapshot next;
-    next.sceneId = g_sceneId.load();
     next.infoLines = g_infoLines;
     if (g_overlayEnabled && (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15)) {
         std::vector<std::wstring> alternate;
@@ -1279,9 +1314,10 @@ void PublishRenderSnapshot()
     }
     next.titleHistoryLines = g_titleHistoryLines;
     next.titleHistoryVisible = g_titleHistoryVisible;
+    next.secondaryInfoPage = g_displayPage != 0;
     {
         std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
-        next.reversalCounterLiveVisible = IsReversalCounterDisplayScene(next.sceneId);
+        next.reversalCounterLiveVisible = g_reversalCounterLiveVisible;
         next.reversalCounterSummaryVisible = g_reversalCounterSummaryVisible;
         next.reversalCounterCount = g_reversalCounterCount;
         next.reversalCounterSummaryCount = g_reversalCounterSummaryCount;
@@ -1291,6 +1327,7 @@ void PublishRenderSnapshot()
         std::lock_guard<std::mutex> lock(g_inputMutex);
         next.inputLine = g_inputLine;
     }
+    next.sceneId = g_sceneId.load();
     next.warningState = static_cast<int>(g_tskWarningState);
     next.overlayEnabled = g_overlayEnabled.load();
     next.inputVisible = g_inputEnabled.load() && next.sceneId == 2;
@@ -1557,9 +1594,11 @@ void RenderGameUi(int screenWidth, int screenHeight)
     } else if (snapshot.overlayEnabled) {
         DrawInfoPanel(draw, screenWidth, screenHeight, snapshot.infoLines,
             snapshot.alternateInfoLines.empty() ? nullptr : &snapshot.alternateInfoLines,
-            false, false);
+            false, snapshot.secondaryInfoPage);
     }
-    if (snapshot.reversalCounterLiveVisible && IsReversalCounterDisplayScene(snapshot.sceneId))
+    if (snapshot.reversalCounterLiveVisible &&
+        (snapshot.sceneId == 8 || snapshot.sceneId == 9 || snapshot.sceneId == 10 ||
+         snapshot.sceneId == 11 || snapshot.sceneId == 13 || snapshot.sceneId == 14))
         DrawLiveReversalCounter(draw, screenWidth, snapshot.reversalCounterCount, snapshot.reversalCounterStatus);
     if (snapshot.reversalCounterSummaryVisible && snapshot.sceneId <= 7 &&
         !(snapshot.sceneId == 2 && snapshot.titleHistoryVisible))
@@ -1634,9 +1673,16 @@ void RegisterReversalCounter(Clock::time_point now)
     std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
     if (g_sceneId != 13 && g_sceneId != 14)
         return;
+    if (g_reversalSessionState != ReversalSessionState::Battle)
+        return;
 
-    const uintptr_t offset = g_clientMode ? kLeftProfileOffset : kRightProfileOffset;
-    std::string opponent = ReadProfile(offset);
+    std::string opponent = g_reversalBattleOpponentProfile;
+    if (opponent.empty())
+        opponent = g_opponentProfile;
+    if (opponent.empty())
+        CaptureBattleOpponentProfile();
+    if (opponent.empty())
+        opponent = g_reversalBattleOpponentProfile;
     if (opponent.empty())
         opponent = g_opponentProfile;
     const std::wstring opponentWide = opponent.empty() ? L"不明" : Cp932ToWide(opponent);
@@ -1656,6 +1702,7 @@ void RegisterReversalCounter(Clock::time_point now)
             g_reversalCounterStatus = L"RLcounter.txt への保存に失敗しました";
             OutputDebugStringW(L"[OIOverlay] Failed to append RLcounter.txt next to the module.\n");
         }
+        g_reversalCounterLiveVisible = true;
         return;
     }
 
@@ -1665,6 +1712,7 @@ void RegisterReversalCounter(Clock::time_point now)
         ConfirmPendingReversalCounter();
 
     ++g_reversalCounterCount;
+    g_reversalCounterLiveVisible = true;
     g_reversalCounterStatus.clear();
     g_reversalCounterPending = true;
     g_reversalCounterPendingClipEligible = true;
@@ -1833,6 +1881,18 @@ DWORD WINAPI OverlayThread(void*)
             if (g_titleHistoryVisible)
                 RefreshTitleHistory();
         } else if (!dismissedReversalSummary && gameForeground && f10Pressed &&
+            (currentScene == 12 || currentScene == 15)) {
+            // Spectator F10 only toggles the information overlay. It never touches RL.
+            const bool enable = !g_overlayEnabled.load();
+            g_overlayEnabled.store(enable);
+            if (!enable)
+                g_overlayManuallyDisabledForSession = true;
+            else {
+                g_displayPage = 0;
+                g_lastPageFlip = now;
+            }
+            UpdateInfoText();
+        } else if (!dismissedReversalSummary && gameForeground && f10Pressed &&
             (currentScene == 13 || currentScene == 14)) {
             RegisterReversalCounter(now);
         } else if (gameForeground && togglePressed && currentScene > 7 &&
@@ -1909,6 +1969,14 @@ DWORD WINAPI OverlayThread(void*)
             UpdateInfoText();
             UpdateInputText();
             g_lastCharacterRefresh = now;
+        }
+
+        // Once a battle starts, keep a stable opponent profile for RL logging.
+        // Do not rely on later character-select SceneIDs to recover host/client side.
+        if (g_reversalSessionState == ReversalSessionState::Battle &&
+            (g_sceneId == 13 || g_sceneId == 14) &&
+            g_reversalBattleOpponentProfile.empty()) {
+            CaptureBattleOpponentProfile();
         }
 
         // Keep existing IP parsing/copy/paste behavior, including the Alt+Enter guard.
