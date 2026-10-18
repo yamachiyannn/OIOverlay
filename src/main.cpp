@@ -105,6 +105,7 @@ bool g_watchP1StatsValid = false;
 bool g_watchP2StatsValid = false;
 std::uintmax_t g_dbSize = 0;
 FILETIME g_dbWriteTime{};
+bool g_dbFileInfoKnown = false;
 
 using Clock = std::chrono::steady_clock;
 // A single F10 is a candidate RL count. A second F10 within three seconds
@@ -1002,12 +1003,13 @@ EnumWindows(FindGameWindowCallback, reinterpret_cast<LPARAM>(&result));
 return result;
 }
 
-void RefreshDatabase()
+bool RefreshDatabase()
 {
 if (!g_playersDatabase && !g_config.playersDbPath.empty())
 g_playersDatabase = std::make_unique<CombinedPlayersDatabase>(g_config.playersDbPath);
 const std::wstring path = FindDefaultDatabase();
-if (path != g_databasePath) {
+if (path == g_databasePath)
+return false;
 g_databasePath = path;
 if (path.empty())
 g_database.reset();
@@ -1017,21 +1019,28 @@ g_normalStatsValid = g_watchP1StatsValid = g_watchP2StatsValid = false;
 g_cachedNormalProfile.clear();
 g_cachedWatchingP1.clear();
 g_cachedWatchingP2.clear();
-}
+g_dbFileInfoKnown = false;
+g_dbSize = 0;
+g_dbWriteTime = {};
+return true;
 }
 
 bool DatabaseChanged()
 {
+// A missing database is not a change on every poll. RefreshDatabase() handles
+// path appearance/disappearance; file metadata changes invalidate cached stats.
 if (g_databasePath.empty())
-return true;
+return false;
 std::uintmax_t size = 0;
 FILETIME writeTime{};
 if (!ReadFileInfo(g_databasePath, size, writeTime))
-return true;
-const bool changed = size != g_dbSize || !IsFileTimeEqual(writeTime, g_dbWriteTime);
+return false;
+const bool changed = !g_dbFileInfoKnown || size != g_dbSize ||
+    !IsFileTimeEqual(writeTime, g_dbWriteTime);
 if (changed) {
 g_dbSize = size;
 g_dbWriteTime = writeTime;
+g_dbFileInfoKnown = true;
 }
 return changed;
 }
@@ -1054,7 +1063,14 @@ g_cachedWatchingP2 = g_watchingP2Profile;
 return;
 }
 
-if (force || g_cachedNormalProfile != g_opponentProfile) {
+const int scene = g_sceneId.load();
+const bool normalInfoActive = IsNormalInfoScene(scene);
+const bool watchingInfoActive = scene == 12 || scene == 15;
+
+// Only compute the stat groups the current scene can display. In particular,
+// a spectator view needs two profile lookups, while character select needs one;
+// do not also scan the database for stale profiles from the other mode.
+if (normalInfoActive && (force || g_cachedNormalProfile != g_opponentProfile)) {
 g_normalStats = {};
 g_normalStatsValid = false;
 if (!g_opponentProfile.empty()) {
@@ -1067,7 +1083,7 @@ g_normalStatsValid = g_database->GetOpponentStats(g_opponentProfile, g_normalSta
 }
 g_cachedNormalProfile = g_opponentProfile;
 }
-if (force || g_cachedWatchingP1 != g_watchingP1Profile) {
+if (watchingInfoActive && (force || g_cachedWatchingP1 != g_watchingP1Profile)) {
 g_watchP1Stats = {};
 g_watchP1StatsValid = false;
 if (!g_watchingP1Profile.empty()) {
@@ -1080,7 +1096,7 @@ g_watchP1StatsValid = g_database->GetOpponentStats(g_watchingP1Profile, g_watchP
 }
 g_cachedWatchingP1 = g_watchingP1Profile;
 }
-if (force || g_cachedWatchingP2 != g_watchingP2Profile) {
+if (watchingInfoActive && (force || g_cachedWatchingP2 != g_watchingP2Profile)) {
 g_watchP2Stats = {};
 g_watchP2StatsValid = false;
 if (!g_watchingP2Profile.empty()) {
@@ -1922,6 +1938,10 @@ DWORD WINAPI OverlayThread(void*)
     g_databasePath = FindDefaultDatabase();
     if (!g_databasePath.empty())
         g_database = std::make_unique<TskDatabase>(g_databasePath);
+    // Capture the initial file timestamp once. The first scene transition will
+    // load its stats; this avoids treating the initial metadata snapshot as a
+    // second DB change and rescanning Default.db immediately afterward.
+    (void)DatabaseChanged();
 
     g_tskRunning = IsTskRunning();
     g_tskWarningState = g_tskRunning ? TskWarningState::None : TskWarningState::NotRunning;
@@ -2047,7 +2067,7 @@ DWORD WINAPI OverlayThread(void*)
         const bool sceneChanged = UpdateSceneState();
         if (sceneChanged) {
             if (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15)
-                RefreshStats(true);
+                RefreshStats(false);
             UpdateInfoText();
             UpdateInputText();
             g_lastCharacterRefresh = now;
@@ -2075,14 +2095,27 @@ DWORD WINAPI OverlayThread(void*)
                 g_normalStatsValid = false;
                 g_cachedNormalProfile.clear();
             }
-            RefreshStats(true);
+            // RefreshStats(false) reuses the last result when the profile did not
+            // change. Do not rescan the full Default.db every second just to keep
+            // the UI alive; scene/profile changes and DB file changes force refreshes.
+            RefreshStats(false);
             UpdateInfoText();
             g_lastCharacterRefresh = now;
         }
 
         if (now - g_lastDbCheck >= std::chrono::milliseconds(500)) {
-            RefreshDatabase();
-            (void)DatabaseChanged();
+            const bool databasePathChanged = RefreshDatabase();
+            const bool databaseChanged = DatabaseChanged();
+            if (databasePathChanged || databaseChanged) {
+                g_normalStatsValid = g_watchP1StatsValid = g_watchP2StatsValid = false;
+                g_cachedNormalProfile.clear();
+                g_cachedWatchingP1.clear();
+                g_cachedWatchingP2.clear();
+                if (IsNormalInfoScene(g_sceneId) || g_sceneId == 12 || g_sceneId == 15) {
+                    RefreshStats(true);
+                    UpdateInfoText();
+                }
+            }
             g_lastDbCheck = now;
         }
 

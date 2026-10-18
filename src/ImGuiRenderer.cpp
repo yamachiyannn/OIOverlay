@@ -511,6 +511,50 @@ std::string WindowsFontPathUtf8(const wchar_t* fileName)
     return WideToUtf8(path);
 }
 
+// Player/profile names stored by Hisouten's TSK database use Windows CP932.
+// Build a compact set of every valid CP932 character rather than asking ImGui
+// to rasterize three entire CJK Unicode blocks (over 28,000 code points).
+// This retains uncommon CP932 kanji while avoiding glyphs that cannot occur in
+// those legacy profile strings.
+void AddCp932GlyphRanges(ImFontGlyphRangesBuilder& builder)
+{
+    auto addCodepageSequence = [&builder](const char* bytes, int byteCount) {
+        wchar_t converted[2]{};
+        const int count = MultiByteToWideChar(
+            932, MB_ERR_INVALID_CHARS, bytes, byteCount, converted,
+            static_cast<int>(_countof(converted)));
+        if (count == 1 && converted[0] != L'\0' &&
+            static_cast<unsigned int>(converted[0]) <= 0xFFFFu) {
+            builder.AddChar(static_cast<ImWchar>(converted[0]));
+        }
+    };
+
+    // Single-byte CP932 characters (skip lead-byte values; they are processed below).
+    for (unsigned int value = 0x20; value <= 0xFF; ++value) {
+        const bool isLeadByte = (value >= 0x81 && value <= 0x9F) ||
+            (value >= 0xE0 && value <= 0xFC);
+        if (isLeadByte)
+            continue;
+        const char byte = static_cast<char>(value);
+        addCodepageSequence(&byte, 1);
+    }
+
+    // Valid Shift-JIS/CP932 lead and trail byte ranges.
+    for (unsigned int lead = 0x81; lead <= 0xFC; ++lead) {
+        if (!((lead >= 0x81 && lead <= 0x9F) ||
+              (lead >= 0xE0 && lead <= 0xFC)))
+            continue;
+        for (unsigned int trail = 0x40; trail <= 0xFC; ++trail) {
+            if (trail == 0x7F)
+                continue;
+            const char bytes[2] = {
+                static_cast<char>(lead), static_cast<char>(trail)
+            };
+            addCodepageSequence(bytes, 2);
+        }
+    }
+}
+
 bool InitializeImGuiForDevice(IDirect3DDevice9* device)
 {
     if (!device)
@@ -528,25 +572,21 @@ bool InitializeImGuiForDevice(IDirect3DDevice9* device)
     const std::string gothicPath = WindowsFontPathUtf8(L"msgothic.ttc");
     const std::string meiryoPath = WindowsFontPathUtf8(L"meiryo.ttc");
 
-    // The built-in Japanese range is curated and omits some uncommon kanji
-    // used in player/profile names (for example 狐 and 萃). Keep the standard
-    // Japanese ranges, then include the BMP CJK unified/extension/compatibility
-    // blocks so names that are valid CP932 text do not become '?' just because
-    // the ImGui atlas did not include their glyphs.
+    // Standard ImGui Japanese glyphs plus every character representable in
+    // CP932. The old configuration rasterized the full CJK Extension A,
+    // Unified Ideographs and Compatibility blocks even though TSK profile
+    // names are stored as CP932. Keep broad name compatibility with a much
+    // smaller, format-appropriate glyph set.
     ImFontGlyphRangesBuilder rangeBuilder;
     rangeBuilder.AddRanges(io.Fonts->GetGlyphRangesJapanese());
-    static const ImWchar extraCjkRanges[] = {
-        0x3400, 0x4DBF, // CJK Unified Ideographs Extension A
-        0x4E00, 0x9FFF, // CJK Unified Ideographs
-        0xF900, 0xFAFF, // CJK Compatibility Ideographs
-        0
-    };
-    rangeBuilder.AddRanges(extraCjkRanges);
+    AddCp932GlyphRanges(rangeBuilder);
     rangeBuilder.BuildRanges(&g_uiGlyphRanges);
 
     ImFontConfig fontConfig{};
-    fontConfig.OversampleH = 3;
-    fontConfig.OversampleV = 2;
+    // Lower oversampling for a faster atlas build; at the existing 16px UI
+    // size this keeps text readable while reducing rasterization work.
+    fontConfig.OversampleH = 2;
+    fontConfig.OversampleV = 1;
     if (!gothicPath.empty())
         g_uiFont = io.Fonts->AddFontFromFileTTF(gothicPath.c_str(), 16.0f, &fontConfig, g_uiGlyphRanges.Data);
     if (!g_uiFont && !meiryoPath.empty())
