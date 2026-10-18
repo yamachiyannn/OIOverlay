@@ -50,11 +50,9 @@ enum class ConnectionRole { Unknown, Host, Client };
 ConnectionRole g_connectionRole = ConnectionRole::Unknown;
 bool g_clientMode = false;
 std::atomic<bool> g_overlayEnabled{true};
-// Tracks the configurable overlay-toggle key and F10 separately. F10 has
-// scene-specific actions (title history / reversal counter) that must not
-// also toggle the normal statistics panel.
-bool g_previousAsyncF10Down = false;
-bool g_previousF10Down = false;
+// All actions formerly assigned to F10 share one edge-triggered key from
+// OIOverlay.ini's ToggleKey setting.
+bool g_previousToggleKeyDown = false;
 bool g_overlayManuallyDisabledForSession = false;
 int g_displayPage = 0;
 bool g_titleHistoryVisible = false;
@@ -108,8 +106,8 @@ FILETIME g_dbWriteTime{};
 bool g_dbFileInfoKnown = false;
 
 using Clock = std::chrono::steady_clock;
-// A single F10 is a candidate RL count. A second F10 within three seconds
-// converts that candidate into a clip marker instead of a count.
+// A single configured ToggleKey press is a candidate RL count. A second press
+// within three seconds converts that candidate into a clip marker instead of a count.
 bool g_reversalCounterPending = false;
 bool g_reversalCounterPendingClipEligible = false;
 Clock::time_point g_reversalCounterPendingSince{};
@@ -1420,6 +1418,33 @@ std::string WideToUtf8ForUi(const std::wstring& value)
     return result;
 }
 
+std::string ConfiguredToggleKeyLabel()
+{
+    const UINT vk = g_config.toggleKey;
+    if (vk == 0)
+        return "無効";
+
+    if (vk >= VK_F1 && vk <= VK_F24)
+        return std::string("F") + std::to_string(vk - VK_F1 + 1);
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+        return std::string(1, static_cast<char>(vk));
+
+    wchar_t name[64]{};
+    const UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
+    if (scanCode != 0) {
+        LONG keyData = static_cast<LONG>((scanCode & 0xFFu) << 16);
+        if ((scanCode & 0xFF00u) == 0xE000u || (scanCode & 0xFF00u) == 0xE100u)
+            keyData |= (1L << 24);
+        const int length = GetKeyNameTextW(keyData, name, static_cast<int>(_countof(name)));
+        if (length > 0)
+            return WideToUtf8ForUi(std::wstring(name, static_cast<size_t>(length)));
+    }
+
+    wchar_t fallback[16]{};
+    std::swprintf(fallback, _countof(fallback), L"VK 0x%02X", vk);
+    return WideToUtf8ForUi(fallback);
+}
+
 struct UiTextLine
 {
     std::string text;
@@ -1636,7 +1661,9 @@ void DrawReversalCounterSummary(ImDrawList* draw, int screenWidth, int screenHei
     if (screenWidth <= 24 || screenHeight <= 24)
         return;
     const std::string label = "RL: " + std::to_string(count);
-    const std::string hint = "F10: 非表示";
+    const std::string hint = g_config.toggleKey == 0
+        ? "操作キー無効"
+        : ConfiguredToggleKeyLabel() + ": 非表示";
     const float fontSize = 48.0f;
     const float hintFontSize = 10.0f;
     ImFont* font = ImGui::GetFont();
@@ -1957,34 +1984,32 @@ DWORD WINAPI OverlayThread(void*)
     while (InterlockedCompareExchange(&g_stopRequested, 0, 0) == 0) {
         const auto now = Clock::now();
 
-        // Poll keys outside the BattleManager hook, so this still works in the
-        // title/menu and full-screen battle scenes. F10 has dedicated actions on
-        // SceneID 2 and 13/14; those actions must not also toggle the info panel.
+        // Poll the configured ToggleKey outside the BattleManager hook so it works
+        // in the title/menu, battle, and spectator scenes. Every former F10 action
+        // uses this same key edge and keeps its existing SceneID-specific behavior.
         const bool toggleDown = g_config.toggleKey != 0 &&
             (GetAsyncKeyState(static_cast<int>(g_config.toggleKey)) & 0x8000) != 0;
-        const bool togglePressed = toggleDown && !g_previousAsyncF10Down;
-        const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-        const bool f10Pressed = f10Down && !g_previousF10Down;
+        const bool togglePressed = toggleDown && !g_previousToggleKeyDown;
         const int currentScene = g_sceneId.load();
         const bool gameForeground = IsGameForeground();
 
         bool dismissedReversalSummary = false;
-        if (gameForeground && f10Pressed && currentScene <= 7) {
+        if (gameForeground && togglePressed && currentScene <= 7) {
             std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
             if (g_reversalCounterSummaryVisible) {
-                // While the post-match count is visible, F10 means "hide this result".
-                // The title-history toggle remains available once the result is hidden.
+                // While the post-match count is visible, ToggleKey means "hide this result".
+                // The title-history toggle remains available on the next press.
                 g_reversalCounterSummaryVisible = false;
                 dismissedReversalSummary = true;
             }
         }
-        if (!dismissedReversalSummary && gameForeground && f10Pressed && currentScene == 2) {
+        if (!dismissedReversalSummary && gameForeground && togglePressed && currentScene == 2) {
             g_titleHistoryVisible = !g_titleHistoryVisible;
             if (g_titleHistoryVisible)
                 RefreshTitleHistory();
-        } else if (!dismissedReversalSummary && gameForeground && f10Pressed &&
+        } else if (!dismissedReversalSummary && gameForeground && togglePressed &&
             (currentScene == 12 || currentScene == 15)) {
-            // Spectator F10 only toggles the information overlay. It never touches RL.
+            // In spectator scenes, ToggleKey only toggles the information overlay; it never touches RL.
             const bool enable = !g_overlayEnabled.load();
             g_overlayEnabled.store(enable);
             if (!enable)
@@ -1994,7 +2019,7 @@ DWORD WINAPI OverlayThread(void*)
                 g_lastPageFlip = now;
             }
             UpdateInfoText();
-        } else if (!dismissedReversalSummary && gameForeground && f10Pressed &&
+        } else if (!dismissedReversalSummary && gameForeground && togglePressed &&
             (currentScene == 13 || currentScene == 14)) {
             RegisterReversalCounter(now);
         } else if (gameForeground && togglePressed && currentScene > 7 &&
@@ -2009,8 +2034,7 @@ DWORD WINAPI OverlayThread(void*)
             }
             UpdateInfoText();
         }
-        g_previousAsyncF10Down = toggleDown;
-        g_previousF10Down = f10Down;
+        g_previousToggleKeyDown = toggleDown;
 
         UpdatePendingReversalCounter(now);
 
