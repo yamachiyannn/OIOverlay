@@ -33,8 +33,15 @@ v2では、iniファイルで各種設定が可能です...設定の手間は少
 
 
 
-v3では、非想天則のウィンドウに直接焼きこむ方式でオーバーレイします
-UIに一部相違点がありますが、機能面ではv2と同じです
+v3以降では、非想天則のウィンドウに直接焼きこむ方式でオーバーレイします
+
+
+
+v4では、リバサルミネスカウンターが追加されました
+DLLファイルと同じ階層にRLnotice.wavを置くとRLカウンターが増えたときに再生します
+二回押しでクリップにしたい部分の時刻をメモすることもできます
+
+その他、タイトル画面でToggleKey（デフォルトではF10）を押すことで連戦履歴を表示する他、IP入力欄で10800を補完したり情報表示を2ページにしたり、一部不具合を修正しました
 
 
 
@@ -64,7 +71,7 @@ OIOverlay=Modules/OIOverlay/OIOverlay.dll
 
 
 
-[v1](https://github.com/yamachiyannn/OIOverlay/releases/download/v1/OIOverlay_v1.zip) / [v2](https://github.com/yamachiyannn/OIOverlay/releases/download/v2/OIOverlay_v2.zip) / [v3](https://github.com/yamachiyannn/OIOverlay/releases/download/v3/OIOverlay_v3.zip)
+[v1](https://github.com/yamachiyannn/OIOverlay/releases/download/v1/OIOverlay_v1.zip) / [v2](https://github.com/yamachiyannn/OIOverlay/releases/download/v2/OIOverlay_v2.zip) / [v4](https://github.com/yamachiyannn/OIOverlay/releases/download/v4/OIOverlay_v4.zip)
 
 
 
@@ -84,5 +91,5 @@ https://github.com/ocornut/imgui
 
 ---
 
-更新: 20261012
+更新: 20261018
 
