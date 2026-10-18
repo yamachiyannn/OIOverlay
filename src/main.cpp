@@ -1430,7 +1430,7 @@ std::string ConfiguredToggleKeyLabel()
         return std::string(1, static_cast<char>(vk));
 
     wchar_t name[64]{};
-    const UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
+    const UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     if (scanCode != 0) {
         LONG keyData = static_cast<LONG>((scanCode & 0xFFu) << 16);
         if ((scanCode & 0xFF00u) == 0xE000u || (scanCode & 0xFF00u) == 0xE100u)
