@@ -127,6 +127,9 @@ Clock::time_point g_lastWindowSearch{};
 Clock::time_point g_lastKeyboardHookCheck{};
 Clock::time_point g_lastPageFlip{};
 OIOverlayAutoRL::Detector g_autoReversalLuminous;
+// Diagnostic overlay for automatic RL: written by BattleManager hook while the
+// counter mutex is held, then copied into the render snapshot.
+std::vector<std::wstring> g_autoRlDebugLines{ L"AUTO RL DEBUG - waiting for battle" };
 
 static int (SokuLib::BattleManager::*g_originalBattleManagerOnProcess)() = nullptr;
 
@@ -1157,6 +1160,7 @@ g_sceneId = scene;
     // from spectator mode to <=7, do not show or write a battle result.
     if (newSpectatorScene) {
         g_autoReversalLuminous.Reset();
+        g_autoRlDebugLines = { L"AUTO RL DEBUG - spectator scene; detector disabled" };
         g_reversalSessionState = ReversalSessionState::Spectator;
         g_reversalCounterPending = false;
         g_reversalCounterPendingClipEligible = false;
@@ -1192,11 +1196,13 @@ g_sceneId = scene;
             g_reversalClipFeedbackUntil = Clock::time_point{};
         }
         g_autoReversalLuminous.Reset();
+        g_autoRlDebugLines = { L"AUTO RL DEBUG - waiting for battle" };
         g_reversalSessionState = ReversalSessionState::None;
         g_reversalBattleOpponentProfile.clear();
     } else if (newBattleScene && g_reversalSessionState != ReversalSessionState::Battle) {
         // A battle entered from title/menu or spectator starts a fresh RL session.
         g_autoReversalLuminous.Reset();
+        g_autoRlDebugLines = { L"AUTO RL DEBUG - battle entered; waiting for game frame" };
         g_reversalSessionState = ReversalSessionState::Battle;
         g_reversalCounterCount = 0;
         g_reversalCounterSummaryCount = 0;
@@ -1366,6 +1372,8 @@ struct RenderSnapshot
     int reversalCounterCount = 0;
     int reversalCounterSummaryCount = 0;
     std::wstring reversalCounterStatus;
+    std::vector<std::wstring> autoRlDebugLines;
+    bool autoRlDebugVisible = false;
 };
 
 std::mutex g_renderSnapshotMutex;
@@ -1394,6 +1402,8 @@ void PublishRenderSnapshot()
         next.reversalCounterCount = g_reversalCounterCount;
         next.reversalCounterSummaryCount = g_reversalCounterSummaryCount;
         next.reversalCounterStatus = g_reversalCounterStatus;
+        next.autoRlDebugLines = g_autoRlDebugLines;
+        next.autoRlDebugVisible = (g_sceneId == 13 || g_sceneId == 14);
     }
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -1694,6 +1704,55 @@ void DrawReversalCounterSummary(ImDrawList* draw, int screenWidth, int screenHei
         IM_COL32(205, 215, 230, 235), hint.c_str());
 }
 
+void DrawAutoRlDebugPanel(ImDrawList* draw, int screenWidth, int screenHeight,
+    const std::vector<std::wstring>& lines)
+{
+    if (!draw || lines.empty() || screenWidth <= 32 || screenHeight <= 32)
+        return;
+
+    ImFont* font = ImGui::GetFont();
+    constexpr float fontSize = 13.0f;
+    constexpr float padX = 8.0f;
+    constexpr float padY = 6.0f;
+    constexpr float lineHeight = 16.0f;
+    float panelWidth = 280.0f;
+    for (const auto& line : lines) {
+        const std::string text = WideToUtf8ForUi(line);
+        const ImVec2 extent = font->CalcTextSizeA(fontSize, 1000.0f, 0.0f,
+            text.c_str(), text.c_str() + text.size());
+        panelWidth = (std::max)(panelWidth, extent.x + padX * 2.0f);
+    }
+    panelWidth = (std::min)(panelWidth, static_cast<float>(screenWidth) - 16.0f);
+    const float panelHeight = padY * 2.0f + lineHeight * static_cast<float>(lines.size());
+    const ImVec2 topLeft(8.0f, 8.0f);
+    const ImVec2 bottomRight((std::min)(topLeft.x + panelWidth, static_cast<float>(screenWidth) - 8.0f),
+        (std::min)(topLeft.y + panelHeight, static_cast<float>(screenHeight) - 8.0f));
+    draw->AddRectFilled(topLeft, bottomRight, IM_COL32(5, 8, 14, 225), 3.0f);
+    draw->AddRect(topLeft, bottomRight, IM_COL32(100, 160, 220, 245), 3.0f, 0, 1.0f);
+
+    float y = topLeft.y + padY;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string text = WideToUtf8ForUi(lines[i]);
+        ImU32 color = IM_COL32(235, 240, 248, 255);
+        if (i == 0)
+            color = IM_COL32(110, 205, 255, 255);
+        else if (lines[i].find(L"[OK]") != std::wstring::npos ||
+                 lines[i].find(L"[SUCCESS]") != std::wstring::npos)
+            color = IM_COL32(105, 245, 130, 255);
+        else if (lines[i].find(L"[FAIL]") != std::wstring::npos ||
+                 lines[i].find(L"[TIMEOUT]") != std::wstring::npos ||
+                 lines[i].find(L"[UNKNOWN]") != std::wstring::npos)
+            color = IM_COL32(255, 120, 120, 255);
+        else if (lines[i].find(L"[WAIT]") != std::wstring::npos ||
+                 lines[i].find(L"[INFO]") != std::wstring::npos)
+            color = IM_COL32(255, 220, 110, 255);
+        draw->PushClipRect(topLeft, bottomRight, true);
+        draw->AddText(font, fontSize, ImVec2(topLeft.x + padX, y), color, text.c_str());
+        draw->PopClipRect();
+        y += lineHeight;
+    }
+}
+
 void RenderGameUi(int screenWidth, int screenHeight)
 {
     // This callback runs on the game render thread. The snapshot is produced by
@@ -1730,6 +1789,8 @@ void RenderGameUi(int screenWidth, int screenHeight)
         DrawReversalCounterSummary(draw, screenWidth, screenHeight, snapshot.reversalCounterSummaryCount);
     if (snapshot.inputVisible)
         DrawInputPanel(draw, screenWidth, screenHeight, snapshot.inputLine);
+    if (snapshot.autoRlDebugVisible && (snapshot.sceneId == 13 || snapshot.sceneId == 14))
+        DrawAutoRlDebugPanel(draw, screenWidth, screenHeight, snapshot.autoRlDebugLines);
     DrawWarningPanel(draw, screenWidth, screenHeight, snapshot.warningState, snapshot.warningBlink);
 }
 
@@ -1921,36 +1982,130 @@ int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
     if (g_originalBattleManagerOnProcess)
         result = (self->*g_originalBattleManagerOnProcess)();
 
-    // Automatic reversal-Luminous detection runs after the game's own update,
-    // so the detector sees the resulting Action/HP state for this game frame.
     bool automaticRlConfirmed = false;
     const int scene = g_sceneId.load();
     if (self && (scene == 13 || scene == 14)) {
         std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
         if (g_reversalSessionState == ReversalSessionState::Battle) {
-            SokuLib::CharacterManager *selfPlayer = nullptr;
-            SokuLib::CharacterManager *opponentPlayer = nullptr;
+            auto* left = &self->leftCharacterManager;
+            auto* right = &self->rightCharacterManager;
+            SokuLib::CharacterManager* selfPlayer = nullptr;
+            SokuLib::CharacterManager* opponentPlayer = nullptr;
+            const wchar_t* roleLabel = L"UNKNOWN";
+            const wchar_t* selfSideLabel = L"UNKNOWN";
+            const wchar_t* opponentSideLabel = L"UNKNOWN";
 
-            // Reuse the existing, persisted role determination. Do not infer
-            // host/client from Scene 8/10/11 once a battle has started.
+            // Connection/profile logic elsewhere in this file treats the host as
+            // LEFT (opponent profile on RIGHT) and the client as RIGHT.
+            // Keep the detector's self/opponent mapping consistent with that rule.
             if (g_connectionRole == ConnectionRole::Client) {
-                selfPlayer = &self->leftCharacterManager;
-                opponentPlayer = &self->rightCharacterManager;
+                selfPlayer = right;
+                opponentPlayer = left;
+                roleLabel = L"CLIENT";
+                selfSideLabel = L"RIGHT";
+                opponentSideLabel = L"LEFT";
             } else if (g_connectionRole == ConnectionRole::Host) {
-                selfPlayer = &self->rightCharacterManager;
-                opponentPlayer = &self->leftCharacterManager;
+                selfPlayer = left;
+                opponentPlayer = right;
+                roleLabel = L"HOST";
+                selfSideLabel = L"LEFT";
+                opponentSideLabel = L"RIGHT";
             }
 
-            if (selfPlayer && opponentPlayer &&
-                g_autoReversalLuminous.Update(
-                    self, selfPlayer, opponentPlayer, Clock::now())) {
-                // Automatic success is immediately confirmed. It does not use
-                // the manual three-second pending count or write a clip marker.
-                ++g_reversalCounterCount;
-                g_reversalCounterLiveVisible = true;
-                g_reversalCounterStatus.clear();
-                automaticRlConfirmed = true;
+            std::vector<std::wstring> lines;
+            lines.reserve(9);
+            lines.push_back(L"AUTO RL DEBUG | Frame=" + std::to_wstring(self->frameCount) +
+                L" | Role=" + std::wstring(roleLabel) + L" | self=" + selfSideLabel);
+            lines.push_back(L"LEFT : Action=" + std::to_wstring(static_cast<unsigned short>(left->objectBase.action)) +
+                L" HP=" + std::to_wstring(left->objectBase.hp));
+            lines.push_back(L"RIGHT: Action=" + std::to_wstring(static_cast<unsigned short>(right->objectBase.action)) +
+                L" HP=" + std::to_wstring(right->objectBase.hp));
+
+            if (!selfPlayer || !opponentPlayer) {
+                lines.push_back(L"[UNKNOWN] Role not resolved; detector is not running");
+                lines.push_back(L"[1] DOWN/Wakeup sequence: unavailable until Host/Client is known");
+                lines.push_back(L"[2] Luminous Action 611: not evaluated");
+                lines.push_back(L"[3] Hit / non-guard HP decrease: not evaluated");
+                lines.push_back(L"RL confirmed count=" + std::to_wstring(g_reversalCounterCount));
+            } else {
+                if (g_autoReversalLuminous.Update(self, selfPlayer, opponentPlayer, Clock::now())) {
+                    // Automatic success is immediately confirmed. It does not use
+                    // the manual three-second pending count or write a clip marker.
+                    ++g_reversalCounterCount;
+                    g_reversalCounterLiveVisible = true;
+                    g_reversalCounterStatus.clear();
+                    automaticRlConfirmed = true;
+                }
+
+                const auto debug = g_autoReversalLuminous.GetDebugSnapshot();
+                lines[0] += L" | chosen selfAct=" + std::to_wstring(debug.selfAction) +
+                    L" oppAct=" + std::to_wstring(debug.opponentAction);
+
+                if (!debug.downDetected) {
+                    lines.push_back(L"[1] [WAIT] No self-down detected yet (self Action=" +
+                        std::to_wstring(debug.selfAction) + L")");
+                } else if (debug.cancelledByOtherAttack) {
+                    lines.push_back(L"[1] [FAIL] Other attack Action occurred before Luminous");
+                } else if (debug.wakeupWindowExpired && !debug.luminousDetected) {
+                    lines.push_back(L"[1] [TIMEOUT] Wakeup-to-Luminous window expired (>3s)");
+                } else if (debug.wakeupWindowActive) {
+                    lines.push_back(L"[1] [OK] Wakeup/tech detected; 3-second window armed");
+                } else if (debug.wakeupDetected && debug.luminousDetected) {
+                    lines.push_back(L"[1] [OK] Wakeup sequence passed");
+                } else if (debug.downDetected && !debug.wakeupDetected) {
+                    lines.push_back(L"[1] [WAIT] Down seen; waiting recognized wakeup Action");
+                } else {
+                    lines.push_back(L"[1] [INFO] Last attempt recorded; waiting for next down");
+                }
+
+                if (debug.luminousDetected) {
+                    lines.push_back(L"[2] [OK] Luminous Action 611 detected; baseline HP=" +
+                        std::to_wstring(debug.baselineOpponentHp));
+                } else if (debug.cancelledByOtherAttack) {
+                    lines.push_back(L"[2] [FAIL] Candidate cancelled before Action 611");
+                } else if (debug.wakeupWindowActive) {
+                    lines.push_back(L"[2] [WAIT] Watching for Luminous Action 611");
+                } else {
+                    lines.push_back(L"[2] [WAIT] Luminous not detected yet");
+                }
+
+                if (debug.successByHitReaction) {
+                    lines.push_back(L"[3] [SUCCESS] Opponent newly entered hit reaction");
+                } else if (debug.successByHpDecrease) {
+                    lines.push_back(L"[3] [SUCCESS] Opponent HP decreased outside guard");
+                } else if (debug.luminousWindowExpired) {
+                    lines.push_back(L"[3] [TIMEOUT] No accepted result within 1 second");
+                } else if (debug.guardChipIgnored && debug.luminousWindowActive) {
+                    lines.push_back(L"[3] [INFO] Guard chip observed and ignored; still checking");
+                } else if (debug.luminousWindowActive) {
+                    lines.push_back(L"[3] [WAIT] Watching opponent hit/guard/HP state");
+                } else if (debug.guardChipIgnored) {
+                    lines.push_back(L"[3] [INFO] Guard chip detected and ignored");
+                } else {
+                    lines.push_back(L"[3] [WAIT] No Luminous result to evaluate yet");
+                }
+
+                lines.push_back(L"SELF=" + std::wstring(selfSideLabel) + L" Action=" +
+                    std::to_wstring(debug.selfAction) + L" HP=" + std::to_wstring(debug.selfHp) +
+                    L" | OPP=" + opponentSideLabel + L" Action=" +
+                    std::to_wstring(debug.opponentAction) + L" HP=" +
+                    std::to_wstring(debug.opponentHp) + L" | guard=" +
+                    (debug.opponentGuarding ? L"YES" : L"NO") + L" hpDeltaThisFrame=" +
+                    (debug.hpDecreasedThisFrame ? L"YES" : L"NO"));
+                lines.push_back(L"RL confirmed count=" + std::to_wstring(g_reversalCounterCount));
             }
+            g_autoRlDebugLines = std::move(lines);
+        } else {
+            std::vector<std::wstring> lines;
+            lines.push_back(L"AUTO RL DEBUG | Frame=" + std::to_wstring(self->frameCount) +
+                L" | session not active");
+            lines.push_back(L"LEFT : Action=" + std::to_wstring(static_cast<unsigned short>(self->leftCharacterManager.objectBase.action)) +
+                L" HP=" + std::to_wstring(self->leftCharacterManager.objectBase.hp));
+            lines.push_back(L"RIGHT: Action=" + std::to_wstring(static_cast<unsigned short>(self->rightCharacterManager.objectBase.action)) +
+                L" HP=" + std::to_wstring(self->rightCharacterManager.objectBase.hp));
+            lines.push_back(L"[UNKNOWN] RL detector paused because session state is not Battle");
+            lines.push_back(L"RL confirmed count=" + std::to_wstring(g_reversalCounterCount));
+            g_autoRlDebugLines = std::move(lines);
         }
     }
 
