@@ -42,7 +42,7 @@ bool Detector::IsHitReaction(SokuLib::Action action) const
 bool Detector::IsGuardAction(SokuLib::Action action) const
 {
     // Guardstun, air guard and wrong-guard states. HP loss during these states
-    // is explicitly diagnostic-only and must not be accepted as a successful RL.
+    // must not be accepted as a successful RL.
     return IsActionInRange(action, 150, 166);
 }
 
@@ -92,24 +92,12 @@ bool Detector::Update(
     const bool hpDecreasedThisFrame = _havePreviousOpponentHp && opponentHp < _previousOpponentHp;
     const bool opponentGuarding = IsGuardAction(opponentAction);
 
-    _debug.hasFrame = true;
-    _debug.gameFrame = battleManager->frameCount;
-    _debug.selfAction = static_cast<unsigned short>(selfAction);
-    _debug.opponentAction = static_cast<unsigned short>(opponentAction);
-    _debug.selfHp = self->objectBase.hp;
-    _debug.opponentHp = opponentHp;
-    _debug.hpDecreasedThisFrame = hpDecreasedThisFrame;
-    _debug.opponentGuarding = opponentGuarding;
-    _debug.stateCode = static_cast<unsigned>(_state);
-
     // Test a pending spell result before handling a new down event. Both players
     // can change state in the same game tick; a simultaneous self-hit must not
     // hide a valid opponent hit reaction from the spell that was just used.
     if (_state == State::LuminousWindow && !_luminousEventConsumed) {
         if (now - _luminousStarted > kLuminousWindow) {
             _state = State::Idle;
-            _debug.luminousWindowActive = false;
-            _debug.luminousWindowExpired = true;
         } else {
             const bool enteredHit = IsHitReaction(opponentAction) &&
                                     !IsHitReaction(_previousOpponentAction);
@@ -117,10 +105,6 @@ bool Detector::Update(
             if (enteredHit || nonGuardHpDecrease) {
                 _luminousEventConsumed = true;
                 _state = State::Idle;
-                _debug.luminousWindowActive = false;
-                _debug.successByHitReaction = enteredHit;
-                _debug.successByHpDecrease = !enteredHit && nonGuardHpDecrease;
-                _debug.stateCode = static_cast<unsigned>(_state);
                 _previousSelfAction = selfAction;
                 _previousOpponentAction = opponentAction;
                 _previousOpponentHp = opponentHp;
@@ -131,25 +115,12 @@ bool Detector::Update(
     }
 
     // A newly observed down state starts a fresh attempt and resets the event
-    // flags so the overlay represents the latest reversal attempt.
+    // flags for the next reversal attempt.
     if (selfDown) {
         if (_state != State::Downed) {
             _state = State::Downed;
             _luminousEventConsumed = false;
-            _debug.downDetected = true;
-            _debug.wakeupDetected = false;
-            _debug.wakeupWindowActive = false;
-            _debug.wakeupWindowExpired = false;
-            _debug.cancelledByOtherAttack = false;
-            _debug.luminousDetected = false;
-            _debug.luminousWindowActive = false;
-            _debug.luminousWindowExpired = false;
-            _debug.successByHitReaction = false;
-            _debug.successByHpDecrease = false;
-            _debug.guardChipIgnored = false;
-            _debug.baselineOpponentHp = 0;
         }
-        _debug.stateCode = static_cast<unsigned>(_state);
         _previousSelfAction = selfAction;
         _previousOpponentAction = opponentAction;
         _previousOpponentHp = opponentHp;
@@ -161,61 +132,28 @@ bool Detector::Update(
         _state = State::WakeupWindow;
         _wakeupWindowStarted = now;
         _luminousEventConsumed = false;
-        _debug.wakeupDetected = true;
-        _debug.wakeupWindowActive = true;
-        _debug.wakeupWindowExpired = false;
     }
 
     if (_state == State::WakeupWindow) {
         if (now - _wakeupWindowStarted > kWakeupWindow) {
             _state = State::Idle;
-            _debug.wakeupWindowActive = false;
-            _debug.wakeupWindowExpired = true;
         } else if (IsNonLuminousAttackAction(selfAction)) {
             // The first non-Luminous attack action invalidates the reversal
             // opportunity. This is action-based, not keyboard-layout-based.
             _state = State::Idle;
-            _debug.wakeupWindowActive = false;
-            _debug.cancelledByOtherAttack = true;
         } else if (luminousStarted &&
                    static_cast<unsigned short>(_previousSelfAction) != kLuminousStrikeAction) {
             _state = State::LuminousWindow;
             _luminousStarted = now;
-            _luminousBaselineHp = opponentHp;
             _luminousEventConsumed = false;
-            _debug.luminousDetected = true;
-            _debug.wakeupWindowActive = false;
-            _debug.luminousWindowActive = true;
-            _debug.luminousWindowExpired = false;
-            _debug.baselineOpponentHp = opponentHp;
         }
     }
 
-    // If still waiting on the post-spell result, diagnose guard chip but do not
-    // accept it. HP is compared frame-to-frame, not merely against the baseline;
-    // otherwise chip damage during guard could be accepted a frame after guardstun.
-    if (_state == State::LuminousWindow && !_luminousEventConsumed) {
-        if (now - _luminousStarted > kLuminousWindow) {
-            _state = State::Idle;
-            _debug.luminousWindowActive = false;
-            _debug.luminousWindowExpired = true;
-        } else if (hpDecreasedThisFrame && opponentGuarding) {
-            _debug.guardChipIgnored = true;
-        }
-    }
-
-    _debug.stateCode = static_cast<unsigned>(_state);
     _previousSelfAction = selfAction;
     _previousOpponentAction = opponentAction;
     _previousOpponentHp = opponentHp;
     _havePreviousOpponentHp = true;
     return false;
-}
-
-Detector::DebugSnapshot Detector::GetDebugSnapshot() const
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _debug;
 }
 
 void Detector::Reset()
@@ -226,13 +164,11 @@ void Detector::Reset()
     _haveGameFrame = false;
     _previousSelfAction = SokuLib::ACTION_IDLE;
     _previousOpponentAction = SokuLib::ACTION_IDLE;
-    _luminousBaselineHp = 0;
     _wakeupWindowStarted = Clock::time_point{};
     _luminousStarted = Clock::time_point{};
     _luminousEventConsumed = false;
     _previousOpponentHp = 0;
     _havePreviousOpponentHp = false;
-    _debug = DebugSnapshot{};
 }
 
 } // namespace OIOverlayAutoRL
