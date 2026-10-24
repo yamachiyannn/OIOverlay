@@ -10,6 +10,7 @@
 #include <mmsystem.h>
 #include <TlHelp32.h>
 #include <SokuLib.hpp>
+#include "AutoReversalLuminous.hpp"
 #include "TskDatabase.hpp"
 #include "CombinedPlayersDatabase.hpp"
 #include "IpPortParser.hpp"
@@ -125,6 +126,7 @@ Clock::time_point g_lastCharacterRefresh{};
 Clock::time_point g_lastWindowSearch{};
 Clock::time_point g_lastKeyboardHookCheck{};
 Clock::time_point g_lastPageFlip{};
+OIOverlayAutoRL::Detector g_autoReversalLuminous;
 
 static int (SokuLib::BattleManager::*g_originalBattleManagerOnProcess)() = nullptr;
 
@@ -1154,6 +1156,7 @@ g_sceneId = scene;
     // Spectator mode is not a reversal-counter session. If the game returns
     // from spectator mode to <=7, do not show or write a battle result.
     if (newSpectatorScene) {
+        g_autoReversalLuminous.Reset();
         g_reversalSessionState = ReversalSessionState::Spectator;
         g_reversalCounterPending = false;
         g_reversalCounterPendingClipEligible = false;
@@ -1188,10 +1191,12 @@ g_sceneId = scene;
             g_reversalCounterStatus.clear();
             g_reversalClipFeedbackUntil = Clock::time_point{};
         }
+        g_autoReversalLuminous.Reset();
         g_reversalSessionState = ReversalSessionState::None;
         g_reversalBattleOpponentProfile.clear();
     } else if (newBattleScene && g_reversalSessionState != ReversalSessionState::Battle) {
         // A battle entered from title/menu or spectator starts a fresh RL session.
+        g_autoReversalLuminous.Reset();
         g_reversalSessionState = ReversalSessionState::Battle;
         g_reversalCounterCount = 0;
         g_reversalCounterSummaryCount = 0;
@@ -1912,11 +1917,48 @@ UpdateInputText();
 
 int __fastcall HookBattleManagerOnProcess(SokuLib::BattleManager* self)
 {
-    // ToggleKey is polled only by OverlayThread. Keep this compatibility hook
-    // pass-through to preserve the existing module setup.
-if (g_originalBattleManagerOnProcess)
-return (self->*g_originalBattleManagerOnProcess)();
-return 0;
+    int result = 0;
+    if (g_originalBattleManagerOnProcess)
+        result = (self->*g_originalBattleManagerOnProcess)();
+
+    // Automatic reversal-Luminous detection runs after the game's own update,
+    // so the detector sees the resulting Action/HP state for this game frame.
+    bool automaticRlConfirmed = false;
+    const int scene = g_sceneId.load();
+    if (self && (scene == 13 || scene == 14)) {
+        std::lock_guard<std::mutex> counterLock(g_reversalCounterMutex);
+        if (g_reversalSessionState == ReversalSessionState::Battle) {
+            SokuLib::CharacterManager *selfPlayer = nullptr;
+            SokuLib::CharacterManager *opponentPlayer = nullptr;
+
+            // Reuse the existing, persisted role determination. Do not infer
+            // host/client from Scene 8/10/11 once a battle has started.
+            if (g_connectionRole == ConnectionRole::Client) {
+                selfPlayer = &self->leftCharacterManager;
+                opponentPlayer = &self->rightCharacterManager;
+            } else if (g_connectionRole == ConnectionRole::Host) {
+                selfPlayer = &self->rightCharacterManager;
+                opponentPlayer = &self->leftCharacterManager;
+            }
+
+            if (selfPlayer && opponentPlayer &&
+                g_autoReversalLuminous.Update(
+                    self, selfPlayer, opponentPlayer, Clock::now())) {
+                // Automatic success is immediately confirmed. It does not use
+                // the manual three-second pending count or write a clip marker.
+                ++g_reversalCounterCount;
+                g_reversalCounterLiveVisible = true;
+                g_reversalCounterStatus.clear();
+                automaticRlConfirmed = true;
+            }
+        }
+    }
+
+    // Play outside the counter lock. Missing/unplayable audio remains harmless.
+    if (automaticRlConfirmed)
+        PlayReversalNoticeIfAvailable();
+
+    return result;
 }
 
 bool InstallBattleManagerProcessHook()
