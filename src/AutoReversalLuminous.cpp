@@ -6,7 +6,7 @@ namespace OIOverlayAutoRL {
 namespace {
 
 constexpr unsigned short kLuminousStrikeAction = 611;
-constexpr std::chrono::seconds kWakeupWindow{3};
+constexpr std::chrono::seconds kWakeupWindow{10};
 constexpr std::chrono::seconds kLuminousWindow{1};
 
 bool IsActionInRange(SokuLib::Action action, unsigned short first, unsigned short last)
@@ -48,13 +48,42 @@ bool Detector::IsGuardAction(SokuLib::Action action) const
 
 bool Detector::IsNonLuminousAttackAction(SokuLib::Action action) const
 {
+    // Only known attack-motion Action IDs invalidate the wake-up window.
+    // Do not treat movement, jumping, dashing, tech, guarding, ordinary
+    // standing/crouching, or generic/system-card actions as attacks merely
+    // because their numeric value falls inside a broad Action range.
+    // These groups are based on the explicit attack and skill-motion groups
+    // in SokuLib's Action.hpp. Their gaps are intentionally excluded.
+    if (IsActionInRange(action, 300, 309) || action == static_cast<SokuLib::Action>(311))
+        return true; // A normals
+    if (IsActionInRange(action, 320, 325) || IsActionInRange(action, 330, 332))
+        return true; // A chains / character-specific A normals
+    if (IsActionInRange(action, 400, 420) || action == static_cast<SokuLib::Action>(422) ||
+        action == static_cast<SokuLib::Action>(430) || action == static_cast<SokuLib::Action>(432))
+        return true; // B/C normals and their listed character variants
+
+    // Explicit contiguous blocks of B/C special-skill motions. Do not include
+    // the gaps between the blocks; those values are not defined attack motions.
+    if (IsActionInRange(action, 500, 503) || IsActionInRange(action, 505, 508) ||
+        IsActionInRange(action, 510, 513) || IsActionInRange(action, 520, 523) ||
+        IsActionInRange(action, 525, 528) || IsActionInRange(action, 530, 533) ||
+        IsActionInRange(action, 540, 543) || IsActionInRange(action, 545, 548) ||
+        IsActionInRange(action, 550, 553) || IsActionInRange(action, 560, 563) ||
+        IsActionInRange(action, 565, 568) || IsActionInRange(action, 570, 573) ||
+        IsActionInRange(action, 580, 583) || IsActionInRange(action, 585, 588) ||
+        IsActionInRange(action, 590, 593))
+        return true;
+
+    // Spell-card motions are attack motions too, except the target Luminous
+    // action itself. Alternate spell-card effect motions are also attack-related.
     const unsigned value = static_cast<unsigned short>(action);
-    if (IsActionInRange(action, 300, 499))
+    if (IsActionInRange(action, 600, 619) && value != kLuminousStrikeAction)
         return true;
-    if (IsActionInRange(action, 500, 599))
+    if (IsActionInRange(action, 650, 669) && value != 661) // 661 is Luminous's alternate effect
         return true;
-    if (IsActionInRange(action, 600, 799) && value != kLuminousStrikeAction)
-        return true;
+
+    // Generic skill/system-card actions (690-698), locomotion, guard and
+    // recovery actions are deliberately not blanket-classified as attacks.
     return false;
 }
 
@@ -135,7 +164,7 @@ bool Detector::Update(
     }
 
     if (_state == State::WakeupWindow) {
-        if (now - _wakeupWindowStarted > kWakeupWindow) {
+        if (now - _wakeupWindowStarted >= kWakeupWindow) {
             _state = State::Idle;
         } else if (IsNonLuminousAttackAction(selfAction)) {
             // The first non-Luminous attack action invalidates the reversal
