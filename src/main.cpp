@@ -130,6 +130,9 @@ OIOverlayAutoRL::Detector g_autoReversalLuminous;
 // Diagnostic overlay for automatic RL: written by BattleManager hook while the
 // counter mutex is held, then copied into the render snapshot.
 std::vector<std::wstring> g_autoRlDebugLines{ L"AUTO RL DEBUG - waiting for battle" };
+// Debug panel starts hidden. It can be toggled by three Enter key presses
+// within a short interval during an active battle (SceneID 13/14).
+std::atomic<bool> g_autoRlDebugVisible{false};
 
 static int (SokuLib::BattleManager::*g_originalBattleManagerOnProcess)() = nullptr;
 
@@ -1403,7 +1406,8 @@ void PublishRenderSnapshot()
         next.reversalCounterSummaryCount = g_reversalCounterSummaryCount;
         next.reversalCounterStatus = g_reversalCounterStatus;
         next.autoRlDebugLines = g_autoRlDebugLines;
-        next.autoRlDebugVisible = (g_sceneId == 13 || g_sceneId == 14);
+        next.autoRlDebugVisible = g_autoRlDebugVisible.load() &&
+            (g_sceneId == 13 || g_sceneId == 14);
     }
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -2178,6 +2182,13 @@ DWORD WINAPI OverlayThread(void*)
 
     PublishRenderSnapshot();
 
+    // Debug overlay toggle gesture state. Enter is edge-detected so a single
+    // held key cannot count as multiple presses. Three distinct presses must
+    // occur within 1.5 seconds and only while an actual match is active.
+    bool previousDebugEnterDown = false;
+    unsigned debugEnterPressCount = 0;
+    Clock::time_point debugEnterSequenceStarted{};
+
     while (InterlockedCompareExchange(&g_stopRequested, 0, 0) == 0) {
         const auto now = Clock::now();
 
@@ -2189,6 +2200,40 @@ DWORD WINAPI OverlayThread(void*)
         const bool togglePressed = toggleDown && !g_previousToggleKeyDown;
         const int currentScene = g_sceneId.load();
         const bool gameForeground = IsGameForeground();
+
+        // Triple-Enter toggles only the automatic-RL diagnostic panel. It does
+        // not alter RL counters, the main information overlay, or ToggleKey.
+        const bool debugEnterDown = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+        const bool debugEnterPressed = debugEnterDown && !previousDebugEnterDown;
+        previousDebugEnterDown = debugEnterDown;
+        const bool activeMatchForDebug = currentScene == 13 || currentScene == 14;
+        if (!gameForeground || !activeMatchForDebug) {
+            debugEnterPressCount = 0;
+            debugEnterSequenceStarted = Clock::time_point{};
+        } else if (debugEnterPressed) {
+            // Preserve Alt+Enter / Ctrl+Enter behavior and don't treat them as
+            // part of the diagnostic shortcut.
+            if (IsAltDown() || IsControlDown()) {
+                debugEnterPressCount = 0;
+                debugEnterSequenceStarted = Clock::time_point{};
+            } else if (debugEnterPressCount == 0 ||
+                now - debugEnterSequenceStarted > std::chrono::milliseconds(1500)) {
+                debugEnterPressCount = 1;
+                debugEnterSequenceStarted = now;
+            } else {
+                ++debugEnterPressCount;
+            }
+
+            if (debugEnterPressCount >= 3) {
+                g_autoRlDebugVisible.store(!g_autoRlDebugVisible.load());
+                debugEnterPressCount = 0;
+                debugEnterSequenceStarted = Clock::time_point{};
+            }
+        } else if (debugEnterPressCount > 0 &&
+            now - debugEnterSequenceStarted > std::chrono::milliseconds(1500)) {
+            debugEnterPressCount = 0;
+            debugEnterSequenceStarted = Clock::time_point{};
+        }
 
         bool dismissedReversalSummary = false;
         if (gameForeground && togglePressed && currentScene <= 7) {
