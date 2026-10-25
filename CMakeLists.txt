@@ -184,6 +184,7 @@ add_library(
     "${PROJECT_NAME}"
     MODULE
     src/main.cpp
+    src/AutoReversalLuminous.cpp
     src/ImGuiRenderer.cpp
     src/ImGuiRenderer.hpp
     src/TskDatabase.cpp
